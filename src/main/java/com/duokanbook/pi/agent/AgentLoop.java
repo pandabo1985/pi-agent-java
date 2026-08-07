@@ -1,6 +1,7 @@
 package com.duokanbook.pi.agent;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -158,7 +159,7 @@ public final class AgentLoop {
 				newMessages.add(message);
 
 				if (message.stopReason() == StopReason.ERROR || message.stopReason() == StopReason.ABORTED) {
-					emit.emit(new AgentEvent.TurnEnd(message, List.of()));
+					emit.emit(new AgentEvent.TurnEnd(message, Collections.<AgentMessage.ToolResultMessage>emptyList()));
 					emit.emit(new AgentEvent.AgentEnd(newMessages));
 					return;
 				}
@@ -244,11 +245,19 @@ public final class AgentLoop {
 		SimpleStreamOptions options = SimpleStreamOptions.builder()
 				.apiKey(resolvedApiKey)
 				.signal(signal)
+				.temperature(config.temperature)
+				.samplingParams(config.samplingParams)
+				.maxTokens(config.maxTokens)
 				.reasoning(config.reasoning)
+				.cacheRetention(config.cacheRetention)
 				.sessionId(config.sessionId)
+				.headers(config.headers)
+				.metadata(config.metadata)
 				.transport(config.transport)
 				.thinkingBudgets(config.thinkingBudgets)
 				.maxRetryDelayMs(config.maxRetryDelayMs)
+				.onPayload(config.onPayload)
+				.onResponse(config.onResponse)
 				.build();
 
 		EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> response =
@@ -258,26 +267,22 @@ public final class AgentLoop {
 		boolean addedPartial = false;
 
 		for (AssistantMessageEvent event : response) {
-			switch (event.type()) {
-				case "start" -> {
+			String type = event.type();
+			if ("start".equals(type)) {
+				partial = event.partialMessage();
+				context.messages.add(partial);
+				addedPartial = true;
+				emit.emit(new AgentEvent.MessageStart(partial));
+			} else if ("text_start".equals(type) || "text_delta".equals(type) || "text_end".equals(type)
+					|| "thinking_start".equals(type) || "thinking_delta".equals(type) || "thinking_end".equals(type)
+					|| "toolcall_start".equals(type) || "toolcall_delta".equals(type) || "toolcall_end".equals(type)) {
+				if (partial != null) {
 					partial = event.partialMessage();
-					context.messages.add(partial);
-					addedPartial = true;
-					emit.emit(new AgentEvent.MessageStart(partial));
+					context.messages.set(context.messages.size() - 1, partial);
+					emit.emit(new AgentEvent.MessageUpdate(partial, event));
 				}
-				case "text_start", "text_delta", "text_end",
-						"thinking_start", "thinking_delta", "thinking_end",
-						"toolcall_start", "toolcall_delta", "toolcall_end" -> {
-					if (partial != null) {
-						partial = event.partialMessage();
-						context.messages.set(context.messages.size() - 1, partial);
-						emit.emit(new AgentEvent.MessageUpdate(partial, event));
-					}
-				}
-				case "done", "error" -> {
-					return finalizeAssistant(response, context, partial, addedPartial, emit);
-				}
-				default -> { /* ignore unknown */ }
+			} else if ("done".equals(type) || "error".equals(type)) {
+				return finalizeAssistant(response, context, partial, addedPartial, emit);
 			}
 		}
 		// Stream exhausted without an explicit done/error: finalize from result().
@@ -304,16 +309,44 @@ public final class AgentLoop {
 
 	// ───────────────────────── tool execution ─────────────────────────
 
-	private record ExecutedToolCallBatch(List<AgentMessage.ToolResultMessage> messages, boolean terminate) {}
-
-	private sealed interface Preparation permits Preparation.Prepared, Preparation.Immediate {
-		record Prepared(Content.ToolCall toolCall, AgentTool tool, Object args) implements Preparation {}
-		record Immediate(AgentToolResult<?> result, boolean isError) implements Preparation {}
+	private static final class ExecutedToolCallBatch extends ValueObject {
+		private final List<AgentMessage.ToolResultMessage> messages;
+		private final boolean terminate;
+		ExecutedToolCallBatch(List<AgentMessage.ToolResultMessage> messages, boolean terminate) { this.messages = messages; this.terminate = terminate; }
+		List<AgentMessage.ToolResultMessage> messages() { return messages; }
+		boolean terminate() { return terminate; }
+		@Override protected String[] componentNames() { return new String[] {"messages", "terminate"}; }
+		@Override protected Object[] componentValues() { return new Object[] {messages, terminate}; }
 	}
-
-	private record ExecutedToolCallOutcome(AgentToolResult<?> result, boolean isError) {}
-
-	private record FinalizedToolCall(Content.ToolCall toolCall, AgentToolResult<?> result, boolean isError) {}
+	private interface Preparation {}
+	private static final class Prepared extends ValueObject implements Preparation {
+		private final Content.ToolCall toolCall; private final AgentTool tool; private final Object args;
+		Prepared(Content.ToolCall toolCall, AgentTool tool, Object args) { this.toolCall = toolCall; this.tool = tool; this.args = args; }
+		Content.ToolCall toolCall() { return toolCall; } AgentTool tool() { return tool; } Object args() { return args; }
+		@Override protected String[] componentNames() { return new String[] {"toolCall", "tool", "args"}; }
+		@Override protected Object[] componentValues() { return new Object[] {toolCall, tool, args}; }
+	}
+	private static final class Immediate extends ValueObject implements Preparation {
+		private final AgentToolResult<?> result; private final boolean isError;
+		Immediate(AgentToolResult<?> result, boolean isError) { this.result = result; this.isError = isError; }
+		AgentToolResult<?> result() { return result; } boolean isError() { return isError; }
+		@Override protected String[] componentNames() { return new String[] {"result", "isError"}; }
+		@Override protected Object[] componentValues() { return new Object[] {result, isError}; }
+	}
+	private static final class ExecutedToolCallOutcome extends ValueObject {
+		private final AgentToolResult<?> result; private final boolean isError;
+		ExecutedToolCallOutcome(AgentToolResult<?> result, boolean isError) { this.result = result; this.isError = isError; }
+		AgentToolResult<?> result() { return result; } boolean isError() { return isError; }
+		@Override protected String[] componentNames() { return new String[] {"result", "isError"}; }
+		@Override protected Object[] componentValues() { return new Object[] {result, isError}; }
+	}
+	private static final class FinalizedToolCall extends ValueObject {
+		private final Content.ToolCall toolCall; private final AgentToolResult<?> result; private final boolean isError;
+		FinalizedToolCall(Content.ToolCall toolCall, AgentToolResult<?> result, boolean isError) { this.toolCall = toolCall; this.result = result; this.isError = isError; }
+		Content.ToolCall toolCall() { return toolCall; } AgentToolResult<?> result() { return result; } boolean isError() { return isError; }
+		@Override protected String[] componentNames() { return new String[] {"toolCall", "result", "isError"}; }
+		@Override protected Object[] componentValues() { return new Object[] {toolCall, result, isError}; }
+	}
 
 	/** Fail every tool call in a message truncated by the output-token limit. */
 	private static ExecutedToolCallBatch failToolCallsFromTruncatedMessage(
@@ -373,10 +406,11 @@ public final class AgentLoop {
 
 			Preparation preparation = prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 			FinalizedToolCall finalized;
-			if (preparation instanceof Preparation.Immediate imm) {
+			if (preparation instanceof Immediate) {
+				Immediate imm = (Immediate) preparation;
 				finalized = new FinalizedToolCall(toolCall, imm.result(), imm.isError());
 			} else {
-				Preparation.Prepared prepared = (Preparation.Prepared) preparation;
+				Prepared prepared = (Prepared) preparation;
 				ExecutedToolCallOutcome executed = executePrepared(prepared, signal, emit);
 				finalized = finalizeExecuted(currentContext, assistantMessage, prepared, executed, config, signal);
 			}
@@ -410,7 +444,8 @@ public final class AgentLoop {
 			emit.emit(new AgentEvent.ToolExecutionStart(toolCall.id(), toolCall.name(), toolCall.arguments()));
 
 			Preparation preparation = prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
-			if (preparation instanceof Preparation.Immediate imm) {
+			if (preparation instanceof Immediate) {
+				Immediate imm = (Immediate) preparation;
 				FinalizedToolCall finalized = new FinalizedToolCall(toolCall, imm.result(), imm.isError());
 				emit.emit(new AgentEvent.ToolExecutionEnd(toolCall.id(), toolCall.name(), finalized.result, finalized.isError));
 				entries.add(() -> CompletableFuture.completedFuture(finalized));
@@ -418,7 +453,7 @@ public final class AgentLoop {
 				continue;
 			}
 
-			Preparation.Prepared prepared = (Preparation.Prepared) preparation;
+			Prepared prepared = (Prepared) preparation;
 			entries.add(() -> {
 				ExecutedToolCallOutcome executed = executePrepared(prepared, signal, emit);
 				FinalizedToolCall finalized = finalizeExecuted(currentContext, assistantMessage, prepared, executed, config, signal);
@@ -479,7 +514,7 @@ public final class AgentLoop {
 
 		AgentTool tool = findTool(currentContext, toolCall.name());
 		if (tool == null) {
-			return new Preparation.Immediate(AgentToolResult.error("Tool " + toolCall.name() + " not found"), true);
+			return new Immediate(AgentToolResult.error("Tool " + toolCall.name() + " not found"), true);
 		}
 		try {
 			Object validatedArgs = validateToolArguments(tool, toolCall);
@@ -488,27 +523,27 @@ public final class AgentLoop {
 						new AgentLoopConfig.BeforeToolCallContext(assistantMessage, toolCall, validatedArgs, currentContext),
 						signal).join();
 				if (signal != null && signal.isAborted()) {
-					return new Preparation.Immediate(AgentToolResult.error("Operation aborted"), true);
+					return new Immediate(AgentToolResult.error("Operation aborted"), true);
 				}
 				if (before != null && before.blocked()) {
 					AgentToolResult<Object> r = AgentToolResult.error(before.reason() != null ? before.reason() : "Tool execution was blocked");
 					if (before.shouldTerminate()) {
 						r = new AgentToolResult<>(r.content(), r.details(), r.usage(), r.addedToolNames(), true);
 					}
-					return new Preparation.Immediate(r, true);
+					return new Immediate(r, true);
 				}
 			}
 			if (signal != null && signal.isAborted()) {
-				return new Preparation.Immediate(AgentToolResult.error("Operation aborted"), true);
+				return new Immediate(AgentToolResult.error("Operation aborted"), true);
 			}
-			return new Preparation.Prepared(toolCall, tool, validatedArgs);
+			return new Prepared(toolCall, tool, validatedArgs);
 		} catch (Throwable e) {
-			return new Preparation.Immediate(AgentToolResult.error(messageOf(e)), true);
+			return new Immediate(AgentToolResult.error(messageOf(e)), true);
 		}
 	}
 
 	private static ExecutedToolCallOutcome executePrepared(
-			Preparation.Prepared prepared, AbortSignal signal, EventSink emit) {
+			Prepared prepared, AbortSignal signal, EventSink emit) {
 
 		AtomicBoolean accepting = new AtomicBoolean(true);
 		String id = prepared.toolCall().id();
@@ -534,7 +569,7 @@ public final class AgentLoop {
 	private static FinalizedToolCall finalizeExecuted(
 			AgentContext currentContext,
 			AgentMessage.AssistantMessage assistantMessage,
-			Preparation.Prepared prepared,
+			Prepared prepared,
 			ExecutedToolCallOutcome executed,
 			AgentLoopConfig config,
 			AbortSignal signal) {
@@ -569,7 +604,7 @@ public final class AgentLoop {
 		return new AgentMessage.ToolResultMessage(
 				finalized.toolCall().id(),
 				finalized.toolCall().name(),
-				r.content() != null ? r.content() : List.of(),
+				r.content() != null ? r.content() : Collections.<Content>emptyList(),
 				r.details(),
 				r.usage(),
 				r.addedToolNames(),
@@ -579,29 +614,11 @@ public final class AgentLoop {
 
 	// ───────────────────────── validation & helpers ─────────────────────────
 
-	/** Apply {@link AgentTool#prepareArguments(Object)} then lightly validate against the schema. */
+	/** Apply {@link AgentTool#prepareArguments(Object)} then coerce and validate against the schema. */
 	private static Object validateToolArguments(AgentTool tool, Content.ToolCall toolCall) {
 		Object args = tool.prepareArguments(toolCall.arguments());
 		Map<String, Object> schema = tool.parameters();
-		if (schema != null) {
-			Object type = schema.get("type");
-			if (type == null || "object".equals(type)) {
-				if (!(args instanceof Map<?, ?>)) {
-					throw new IllegalArgumentException("Tool " + toolCall.name() + " expects an object argument");
-				}
-				Object required = schema.get("required");
-				if (required instanceof List<?> reqList) {
-					Map<?, ?> argMap = (Map<?, ?>) args;
-					for (Object r : reqList) {
-						if (!argMap.containsKey(r)) {
-							throw new IllegalArgumentException(
-									"Tool " + toolCall.name() + " missing required argument: " + r);
-						}
-					}
-				}
-			}
-		}
-		return args;
+		return schema != null ? JsonSchemaValidator.coerceAndValidate(toolCall.name(), args, schema) : args;
 	}
 
 	private static AgentTool findTool(AgentContext ctx, String name) {
@@ -615,7 +632,7 @@ public final class AgentLoop {
 	private static List<Content.ToolCall> toolCallsOf(AgentMessage.AssistantMessage message) {
 		List<Content.ToolCall> out = new ArrayList<>();
 		for (Content c : message.content()) {
-			if (c instanceof Content.ToolCall tc) out.add(tc);
+			if (c instanceof Content.ToolCall) out.add((Content.ToolCall) c);
 		}
 		return out;
 	}

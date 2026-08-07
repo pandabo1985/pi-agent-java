@@ -1,6 +1,8 @@
 package com.duokanbook.pi.agent;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -23,26 +25,19 @@ public final class Main {
 		Agent.AgentOptions options = new Agent.AgentOptions();
 		options.model = model;
 		options.systemPrompt = "You are a helpful demo agent.";
-		options.tools = List.of(new EchoTool());
+		options.tools = Collections.<AgentTool>singletonList(new EchoTool());
 		options.streamFn = new FakeStreamFn();
 		options.toolExecution = ToolExecutionMode.PARALLEL;
 
 		Agent agent = new Agent(options);
 		agent.subscribe((event, signal) -> {
-			switch (event.type()) {
-				case "message_start" -> System.out.println("  > " + event.type() + " " + describe(event));
-				case "message_end" -> System.out.println("  > " + event.type() + " " + describe(event));
-				case "tool_execution_start" -> System.out.println("  > tool_execution_start "
-						+ ((AgentEvent.ToolExecutionStart) event).toolName()
-						+ "(" + ((AgentEvent.ToolExecutionStart) event).args() + ")");
-				case "tool_execution_end" -> System.out.println("  > tool_execution_end "
-						+ ((AgentEvent.ToolExecutionEnd) event).toolName()
-						+ " -> " + textOf(((AgentEvent.ToolExecutionEnd) event).result())
-						+ (event instanceof AgentEvent.ToolExecutionEnd e && e.isError() ? " [ERROR]" : ""));
-				case "turn_end" -> System.out.println("== turn_end ==");
-				case "agent_end" -> System.out.println("== agent_end (" + ((AgentEvent.AgentEnd) event).messages().size() + " new messages) ==");
-				default -> { /* turn_start, agent_start, message_update, tool_execution_update: quiet */ }
-			}
+			if ("message_start".equals(event.type()) || "message_end".equals(event.type())) System.out.println("  > " + event.type() + " " + describe(event));
+			else if ("tool_execution_start".equals(event.type())) System.out.println("  > tool_execution_start " + ((AgentEvent.ToolExecutionStart) event).toolName() + "(" + ((AgentEvent.ToolExecutionStart) event).args() + ")");
+			else if ("tool_execution_end".equals(event.type())) {
+				AgentEvent.ToolExecutionEnd end = (AgentEvent.ToolExecutionEnd) event;
+				System.out.println("  > tool_execution_end " + end.toolName() + " -> " + textOf(end.result()) + (end.isError() ? " [ERROR]" : ""));
+			} else if ("turn_end".equals(event.type())) System.out.println("== turn_end ==");
+			else if ("agent_end".equals(event.type())) System.out.println("== agent_end (" + ((AgentEvent.AgentEnd) event).messages().size() + " new messages) ==");
 		});
 
 		System.out.println("### prompt: \"echo hello\"");
@@ -70,16 +65,16 @@ public final class Main {
 						String text = userText((AgentMessage.UserMessage) last);
 						Map<String, Object> args = new LinkedHashMap<>();
 						args.put("text", text);
-						AgentMessage.AssistantMessage msg = assistant(model, List.of(
+						AgentMessage.AssistantMessage msg = assistant(model, Collections.<Content>singletonList(
 								new Content.ToolCall("call_1", "echo", args)));
 						streamMessage(s, model, msg);
 					} else if ("toolResult".equals(last.role())) {
 						String result = toolResultText((AgentMessage.ToolResultMessage) last);
-						AgentMessage.AssistantMessage msg = assistant(model, List.of(
+						AgentMessage.AssistantMessage msg = assistant(model, Collections.<Content>singletonList(
 								new Content.Text("Tool replied: " + result)), StopReason.STOP);
 						streamMessage(s, model, msg);
 					} else {
-						streamMessage(s, model, assistant(model, List.of(new Content.Text("(nothing to do)")), StopReason.STOP));
+						streamMessage(s, model, assistant(model, Collections.<Content>singletonList(new Content.Text("(nothing to do)")), StopReason.STOP));
 					}
 				} catch (Throwable e) {
 					s.completeExceptionally(e);
@@ -92,19 +87,21 @@ public final class Main {
 
 		private static void streamMessage(EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> s,
 				Model model, AgentMessage.AssistantMessage finalMessage) {
-			AssistantMessageEvent partial0 = new AssistantMessageEvent.Start(snap(model, List.of(), StopReason.PENDING));
+			AssistantMessageEvent partial0 = new AssistantMessageEvent.Start(snap(model, Collections.<Content>emptyList(), StopReason.PENDING));
 			s.push(partial0);
 
 			List<Content> building = new ArrayList<>();
 			for (Content c : finalMessage.content()) {
 				int idx = building.size();
-				if (c instanceof Content.Text t) {
+				if (c instanceof Content.Text) {
+					Content.Text t = (Content.Text) c;
 					building.add(new Content.Text(""));
 					s.push(new AssistantMessageEvent.TextStart(idx, snap(model, copy(building), StopReason.PENDING)));
 					building.set(idx, new Content.Text(t.text()));
 					s.push(new AssistantMessageEvent.TextDelta(idx, t.text(), snap(model, copy(building), StopReason.PENDING)));
 					s.push(new AssistantMessageEvent.TextEnd(idx, t.text(), snap(model, copy(building), StopReason.PENDING)));
-				} else if (c instanceof Content.ToolCall tc) {
+				} else if (c instanceof Content.ToolCall) {
+					Content.ToolCall tc = (Content.ToolCall) c;
 					building.add(new Content.ToolCall(tc.id(), tc.name(), new LinkedHashMap<>()));
 					s.push(new AssistantMessageEvent.ToolCallStart(idx, snap(model, copy(building), StopReason.PENDING)));
 					String json = Json.stringify(tc.arguments());
@@ -138,14 +135,14 @@ public final class Main {
 
 		private static String userText(AgentMessage.UserMessage u) {
 			for (Content c : u.content()) {
-				if (c instanceof Content.Text t) return t.text();
+				if (c instanceof Content.Text) return ((Content.Text) c).text();
 			}
 			return "";
 		}
 
 		private static String toolResultText(AgentMessage.ToolResultMessage t) {
 			for (Content c : t.content()) {
-				if (c instanceof Content.Text tx) return tx.text();
+				if (c instanceof Content.Text) return ((Content.Text) c).text();
 			}
 			return "";
 		}
@@ -162,11 +159,13 @@ public final class Main {
 		@Override
 		public Map<String, Object> parameters() {
 			Map<String, Object> props = new LinkedHashMap<>();
-			props.put("text", Map.of("type", "string"));
+			Map<String, Object> textSchema = new LinkedHashMap<>();
+			textSchema.put("type", "string");
+			props.put("text", textSchema);
 			Map<String, Object> schema = new LinkedHashMap<>();
 			schema.put("type", "object");
 			schema.put("properties", props);
-			schema.put("required", List.of("text"));
+			schema.put("required", Collections.singletonList("text"));
 			return schema;
 		}
 
@@ -183,8 +182,8 @@ public final class Main {
 	// ───────────────────────── pretty-printing helpers ─────────────────────────
 
 	private static String describe(AgentEvent e) {
-		if (e instanceof AgentEvent.MessageStart ms) return describe(ms.message());
-		if (e instanceof AgentEvent.MessageEnd me) return describe(me.message());
+		if (e instanceof AgentEvent.MessageStart) return describe(((AgentEvent.MessageStart) e).message());
+		if (e instanceof AgentEvent.MessageEnd) return describe(((AgentEvent.MessageEnd) e).message());
 		return "";
 	}
 
@@ -194,8 +193,8 @@ public final class Main {
 			case "assistant": {
 				StringBuilder sb = new StringBuilder("assistant:");
 				for (Content c : ((AgentMessage.AssistantMessage) m).content()) {
-					if (c instanceof Content.Text t) sb.append(" text=\"").append(t.text()).append("\"");
-					if (c instanceof Content.ToolCall tc) sb.append(" toolCall=").append(tc.name()).append("(").append(tc.arguments()).append(")");
+					if (c instanceof Content.Text) sb.append(" text=\"").append(((Content.Text) c).text()).append("\"");
+					if (c instanceof Content.ToolCall) sb.append(" toolCall=").append(((Content.ToolCall) c).name()).append("(").append(((Content.ToolCall) c).arguments()).append(")");
 				}
 				return sb.toString();
 			}
@@ -205,18 +204,18 @@ public final class Main {
 	}
 
 	private static String textOf(AgentMessage.UserMessage u) {
-		for (Content c : u.content()) if (c instanceof Content.Text t) return t.text();
+		for (Content c : u.content()) if (c instanceof Content.Text) return ((Content.Text) c).text();
 		return "";
 	}
 
 	private static String textOf(AgentMessage.ToolResultMessage t) {
-		for (Content c : t.content()) if (c instanceof Content.Text tx) return tx.text();
+		for (Content c : t.content()) if (c instanceof Content.Text) return ((Content.Text) c).text();
 		return "";
 	}
 
 	private static String textOf(AgentToolResult<?> r) {
 		if (r == null || r.content() == null) return "";
-		for (Content c : r.content()) if (c instanceof Content.Text t) return t.text();
+		for (Content c : r.content()) if (c instanceof Content.Text) return ((Content.Text) c).text();
 		return "";
 	}
 }

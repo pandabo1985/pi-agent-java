@@ -58,32 +58,36 @@ public final class MessageJson {
 	public static Object toJson(Content c) {
 		Map<String, Object> o = new LinkedHashMap<>();
 		switch (c.type()) {
-			case "text" -> {
+			case "text": {
 				Content.Text t = (Content.Text) c;
 				o.put("type", "text");
 				o.put("text", t.text());
 				if (t.textSignature() != null) o.put("textSignature", t.textSignature());
+				break;
 			}
-			case "image" -> {
+			case "image": {
 				Content.Image i = (Content.Image) c;
 				o.put("type", "image");
 				o.put("data", i.data());
 				o.put("mimeType", i.mimeType());
+				break;
 			}
-			case "thinking" -> {
+			case "thinking": {
 				Content.Thinking t = (Content.Thinking) c;
 				o.put("type", "thinking");
 				o.put("thinking", t.thinking());
 				if (t.thinkingSignature() != null) o.put("thinkingSignature", t.thinkingSignature());
+				break;
 			}
-			case "toolCall" -> {
+			case "toolCall": {
 				Content.ToolCall tc = (Content.ToolCall) c;
 				o.put("type", "toolCall");
 				o.put("id", tc.id());
 				o.put("name", tc.name());
 				o.put("arguments", tc.arguments() != null ? tc.arguments() : new LinkedHashMap<String, Object>());
+				break;
 			}
-			default -> o.put("type", c.type());
+			default: o.put("type", c.type());
 		}
 		return o;
 	}
@@ -91,13 +95,14 @@ public final class MessageJson {
 	public static Object toJson(AgentMessage m) {
 		Map<String, Object> o = new LinkedHashMap<>();
 		switch (m.role()) {
-			case "user" -> {
+			case "user": {
 				AgentMessage.UserMessage u = (AgentMessage.UserMessage) m;
 				o.put("role", "user");
 				o.put("content", contentList(u.content()));
 				o.put("timestamp", u.timestamp());
+				break;
 			}
-			case "assistant" -> {
+			case "assistant": {
 				AgentMessage.AssistantMessage a = (AgentMessage.AssistantMessage) m;
 				o.put("role", "assistant");
 				o.put("content", contentList(a.content()));
@@ -108,8 +113,9 @@ public final class MessageJson {
 				o.put("stopReason", a.stopReason().wire());
 				if (a.errorMessage() != null) o.put("errorMessage", a.errorMessage());
 				o.put("timestamp", a.timestamp());
+				break;
 			}
-			case "toolResult" -> {
+			case "toolResult": {
 				AgentMessage.ToolResultMessage t = (AgentMessage.ToolResultMessage) m;
 				o.put("role", "toolResult");
 				o.put("toolCallId", t.toolCallId());
@@ -120,12 +126,14 @@ public final class MessageJson {
 				if (t.addedToolNames() != null && !t.addedToolNames().isEmpty()) o.put("addedToolNames", t.addedToolNames());
 				o.put("isError", t.isError());
 				o.put("timestamp", t.timestamp());
+				break;
 			}
-			default -> {
+			default: {
 				AgentMessage.CustomMessage c = (AgentMessage.CustomMessage) m;
 				o.put("role", c.type());
 				if (c.data() != null) o.putAll(c.data());
 				o.put("timestamp", c.timestamp());
+				break;
 			}
 		}
 		return o;

@@ -4,10 +4,10 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.io.OutputStream;
+import java.io.ByteArrayOutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -35,7 +35,6 @@ public final class ProxyStreamFn implements StreamFn {
 
 	private final String proxyUrl;
 	private final Supplier<String> authTokenSupplier;
-	private final HttpClient client;
 
 	public ProxyStreamFn(String proxyUrl, String authToken) {
 		this(proxyUrl, () -> authToken);
@@ -44,7 +43,6 @@ public final class ProxyStreamFn implements StreamFn {
 	public ProxyStreamFn(String proxyUrl, Supplier<String> authTokenSupplier) {
 		this.proxyUrl = proxyUrl;
 		this.authTokenSupplier = authTokenSupplier;
-		this.client = HttpClient.newHttpClient();
 	}
 
 	@Override
@@ -63,12 +61,14 @@ public final class ProxyStreamFn implements StreamFn {
 
 		Reconstructor rc = new Reconstructor(model);
 		final InputStream[] holder = {null};
+		final HttpURLConnection[] connection = {null};
 
 		// Abort handling: cancel the in-flight HTTP exchange / close the body.
 		Runnable abortListener = () -> {
 			if (holder[0] != null) {
 				try { holder[0].close(); } catch (IOException ignored) {}
 			}
+			if (connection[0] != null) connection[0].disconnect();
 		};
 		if (options != null && options.signal() != null) {
 			options.signal().addListener(abortListener);
@@ -76,20 +76,25 @@ public final class ProxyStreamFn implements StreamFn {
 
 		try {
 			String body = buildRequestBody(model, context, options);
-			HttpRequest req = HttpRequest.newBuilder(URI.create(proxyUrl + "/api/stream"))
-					.header("Authorization", "Bearer " + authTokenSupplier.get())
-					.header("Content-Type", "application/json")
-					.POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-					.build();
-
-			HttpResponse<InputStream> resp = client.send(req, HttpResponse.BodyHandlers.ofInputStream());
-			if (resp.statusCode() / 100 != 2) {
-				String message = "Proxy error: " + resp.statusCode() + " " + resp.statusCode();
+			HttpURLConnection request = (HttpURLConnection) new URL(proxyUrl + "/api/stream").openConnection();
+			connection[0] = request;
+			request.setRequestMethod("POST");
+			request.setDoOutput(true);
+			request.setRequestProperty("Authorization", "Bearer " + authTokenSupplier.get());
+			request.setRequestProperty("Content-Type", "application/json");
+			byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+			request.setFixedLengthStreamingMode(bytes.length);
+			OutputStream output = request.getOutputStream();
+			try { output.write(bytes); } finally { output.close(); }
+			int status = request.getResponseCode();
+			String statusText = request.getResponseMessage();
+			holder[0] = status / 100 == 2 ? request.getInputStream() : request.getErrorStream();
+			if (status / 100 != 2) {
+				String message = proxyErrorMessage(status, statusText, holder[0]);
 				terminateWithError(stream, rc, options, message);
 				return;
 			}
 
-			holder[0] = resp.body();
 			BufferedReader reader = new BufferedReader(new InputStreamReader(holder[0], StandardCharsets.UTF_8));
 			String line;
 			while ((line = reader.readLine()) != null) {
@@ -101,7 +106,9 @@ public final class ProxyStreamFn implements StreamFn {
 				if (data.isEmpty()) continue;
 				Object parsed = Json.parse(data);
 				if (!(parsed instanceof Map<?, ?>)) continue;
-				AssistantMessageEvent ev = rc.process(asMap(parsed));
+				@SuppressWarnings("unchecked")
+				Map<String, Object> event = (Map<String, Object>) parsed;
+				AssistantMessageEvent ev = rc.process(event);
 				if (ev != null) stream.push(ev);
 			}
 			// Stream ended without a terminal event — finalize from the current partial.
@@ -118,6 +125,7 @@ public final class ProxyStreamFn implements StreamFn {
 			if (holder[0] != null) {
 				try { holder[0].close(); } catch (IOException ignored) {}
 			}
+			if (connection[0] != null) connection[0].disconnect();
 		}
 	}
 
@@ -143,14 +151,48 @@ public final class ProxyStreamFn implements StreamFn {
 
 		Map<String, Object> opts = new LinkedHashMap<>();
 		if (options != null) {
+			putIfNotNull(opts, "temperature", options.temperature());
+			putIfNotNull(opts, "samplingParams", options.samplingParams());
+			putIfNotNull(opts, "maxTokens", options.maxTokens());
 			if (options.reasoning() != null) opts.put("reasoning", options.reasoning().name().toLowerCase());
-			opts.put("sessionId", options.sessionId());
-			opts.put("transport", options.transport());
-			opts.put("thinkingBudgets", options.thinkingBudgets());
-			opts.put("maxRetryDelayMs", options.maxRetryDelayMs());
+			putIfNotNull(opts, "cacheRetention", options.cacheRetention());
+			putIfNotNull(opts, "sessionId", options.sessionId());
+			putIfNotNull(opts, "headers", options.headers());
+			putIfNotNull(opts, "metadata", options.metadata());
+			putIfNotNull(opts, "transport", options.transport());
+			putIfNotNull(opts, "thinkingBudgets", options.thinkingBudgets());
+			putIfNotNull(opts, "maxRetryDelayMs", options.maxRetryDelayMs());
 		}
 		root.put("options", opts);
 		return Json.stringify(root);
+	}
+
+	private static void putIfNotNull(Map<String, Object> target, String key, Object value) {
+		if (value != null) target.put(key, value);
+	}
+
+	private static String proxyErrorMessage(int status, String statusText, InputStream body) {
+		String fallback = "Proxy error: " + status
+				+ (statusText != null && !statusText.isEmpty() ? " " + statusText : "");
+		try {
+			if (body == null) return fallback;
+			Object parsed = Json.parse(new String(readAll(body), StandardCharsets.UTF_8));
+			if (parsed instanceof Map<?, ?>) {
+				Object errorValue = ((Map<?, ?>) parsed).get("error");
+				if (errorValue instanceof String && !((String) errorValue).isEmpty()) return "Proxy error: " + errorValue;
+			}
+		} catch (IOException | IllegalArgumentException ignored) {
+			// Keep the status-only fallback when the proxy does not return a JSON error body.
+		}
+		return fallback;
+	}
+
+	private static byte[] readAll(InputStream input) throws IOException {
+		ByteArrayOutputStream output = new ByteArrayOutputStream();
+		byte[] buffer = new byte[4096];
+		int read;
+		while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+		return output.toByteArray();
 	}
 
 	private static String messageOf(Throwable e) {
@@ -159,16 +201,11 @@ public final class ProxyStreamFn implements StreamFn {
 		return c.getMessage() != null ? c.getMessage() : c.toString();
 	}
 
-	@SuppressWarnings("unchecked")
-	private static Map<String, Object> asMap(Object o) {
-		return (Map<String, Object>) o;
-	}
-
 	// ───────────────────────── partial-message reconstruction ─────────────────────────
 
 	/**
 	 * Rebuilds the cumulative assistant message from bandwidth-optimized proxy events. Produces a
-	 * fresh {@link AgentMessage.AssistantMessage} snapshot per event (immutable records), which the
+	 * fresh immutable {@link AgentMessage.AssistantMessage} snapshot per event, which the
 	 * loop stores into the transcript on each update.
 	 */
 	private static final class Reconstructor {
@@ -309,21 +346,27 @@ public final class ProxyStreamFn implements StreamFn {
 		}
 
 		private Usage usageOf(Object raw) {
-			if (!(raw instanceof Map<?, ?> m)) return Usage.empty();
+			if (!(raw instanceof Map<?, ?>)) return Usage.empty();
+			Map<?, ?> m = (Map<?, ?>) raw;
+			Map<?, ?> cost = m.get("cost") instanceof Map<?, ?> ? (Map<?, ?>) m.get("cost") : null;
 			return new Usage(
 					longOf(m.get("input")), longOf(m.get("output")),
 					longOf(m.get("cacheRead")), longOf(m.get("cacheWrite")),
 					longOf(m.get("totalTokens")),
-					new Usage.Cost(numOf(m.get("cost") != null ? ((Map<?, ?>) m.get("cost")).get("total") : null), 0, 0, 0,
-							numOf(m.get("cost") != null ? ((Map<?, ?>) m.get("cost")).get("total") : null)));
+					new Usage.Cost(
+							numOf(cost != null ? cost.get("input") : null),
+							numOf(cost != null ? cost.get("output") : null),
+							numOf(cost != null ? cost.get("cacheRead") : null),
+							numOf(cost != null ? cost.get("cacheWrite") : null),
+							numOf(cost != null ? cost.get("total") : null)));
 		}
 
 		private static long longOf(Object o) {
-			return o instanceof Number n ? n.longValue() : 0L;
+			return o instanceof Number ? ((Number) o).longValue() : 0L;
 		}
 
 		private static double numOf(Object o) {
-			return o instanceof Number n ? n.doubleValue() : 0.0;
+			return o instanceof Number ? ((Number) o).doubleValue() : 0.0;
 		}
 	}
 }

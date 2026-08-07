@@ -1,6 +1,7 @@
 package com.duokanbook.pi.agent;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -24,9 +25,17 @@ public final class AgentLoopConfig {
 	public ThinkingLevel reasoning;
 	public String sessionId;
 	public String apiKey;
+	public Double temperature;
+	public Map<String, Object> samplingParams;
+	public Long maxTokens;
+	public String cacheRetention;
+	public Map<String, String> headers;
+	public Map<String, Object> metadata;
 	public String transport = "auto";
 	public Object thinkingBudgets;
 	public Long maxRetryDelayMs;
+	public SimpleStreamOptions.OnPayload onPayload;
+	public SimpleStreamOptions.OnResponse onResponse;
 
 	// ── required hook ──
 	/** Converts the transcript to LLM-visible messages before each model call. Required. */
@@ -49,36 +58,94 @@ public final class AgentLoopConfig {
 		this.convertToLlm = convertToLlm;
 	}
 
-	// ───────────────────────── nested context / result records ─────────────────────────
+	// ───────────────────────── nested context / result classes ─────────────────────────
 
 	/** Context passed to {@link BeforeToolCall}. */
-	public record BeforeToolCallContext(
-			AgentMessage.AssistantMessage assistantMessage,
-			Content.ToolCall toolCall,
-			Object args,
-			AgentContext context) {}
+	public static final class BeforeToolCallContext extends ValueObject {
+		private final AgentMessage.AssistantMessage assistantMessage;
+		private final Content.ToolCall toolCall;
+		private final Object args;
+		private final AgentContext context;
+		public BeforeToolCallContext(AgentMessage.AssistantMessage assistantMessage, Content.ToolCall toolCall, Object args, AgentContext context) {
+			this.assistantMessage = assistantMessage; this.toolCall = toolCall; this.args = args; this.context = context;
+		}
+		public AgentMessage.AssistantMessage assistantMessage() { return assistantMessage; }
+		public Content.ToolCall toolCall() { return toolCall; }
+		public Object args() { return args; }
+		public AgentContext context() { return context; }
+		@Override protected String[] componentNames() { return new String[] {"assistantMessage", "toolCall", "args", "context"}; }
+		@Override protected Object[] componentValues() { return new Object[] {assistantMessage, toolCall, args, context}; }
+	}
 
 	/** Context passed to {@link AfterToolCall}. */
-	public record AfterToolCallContext(
-			AgentMessage.AssistantMessage assistantMessage,
-			Content.ToolCall toolCall,
-			Object args,
-			AgentToolResult<?> result,
-			boolean isError,
-			AgentContext context) {}
+	public static final class AfterToolCallContext extends ValueObject {
+		private final AgentMessage.AssistantMessage assistantMessage;
+		private final Content.ToolCall toolCall;
+		private final Object args;
+		private final AgentToolResult<?> result;
+		private final boolean isError;
+		private final AgentContext context;
+		public AfterToolCallContext(AgentMessage.AssistantMessage assistantMessage, Content.ToolCall toolCall, Object args,
+				AgentToolResult<?> result, boolean isError, AgentContext context) {
+			this.assistantMessage = assistantMessage; this.toolCall = toolCall; this.args = args; this.result = result;
+			this.isError = isError; this.context = context;
+		}
+		public AgentMessage.AssistantMessage assistantMessage() { return assistantMessage; }
+		public Content.ToolCall toolCall() { return toolCall; }
+		public Object args() { return args; }
+		public AgentToolResult<?> result() { return result; }
+		public boolean isError() { return isError; }
+		public AgentContext context() { return context; }
+		@Override protected String[] componentNames() { return new String[] {"assistantMessage", "toolCall", "args", "result", "isError", "context"}; }
+		@Override protected Object[] componentValues() { return new Object[] {assistantMessage, toolCall, args, result, isError, context}; }
+	}
 
 	/** Context passed to {@link ShouldStopAfterTurn} and {@link PrepareNextTurn}. */
-	public record TurnContext(
-			AgentMessage.AssistantMessage message,
-			List<AgentMessage.ToolResultMessage> toolResults,
-			AgentContext context,
-			List<AgentMessage> newMessages) {}
+	public static final class TurnContext extends ValueObject {
+		private final AgentMessage.AssistantMessage message;
+		private final List<AgentMessage.ToolResultMessage> toolResults;
+		private final AgentContext context;
+		private final List<AgentMessage> newMessages;
+		public TurnContext(AgentMessage.AssistantMessage message, List<AgentMessage.ToolResultMessage> toolResults,
+				AgentContext context, List<AgentMessage> newMessages) {
+			this.message = message; this.toolResults = toolResults; this.context = context; this.newMessages = newMessages;
+		}
+		public AgentMessage.AssistantMessage message() { return message; }
+		public List<AgentMessage.ToolResultMessage> toolResults() { return toolResults; }
+		public AgentContext context() { return context; }
+		public List<AgentMessage> newMessages() { return newMessages; }
+		@Override protected String[] componentNames() { return new String[] {"message", "toolResults", "context", "newMessages"}; }
+		@Override protected Object[] componentValues() { return new Object[] {message, toolResults, context, newMessages}; }
+	}
 
 	/** Replacement runtime state returned from {@link PrepareNextTurn}. */
-	public record TurnUpdate(AgentContext context, Model model, ThinkingLevel thinkingLevel) {}
+	public static final class TurnUpdate extends ValueObject {
+		private final AgentContext context;
+		private final Model model;
+		private final ThinkingLevel thinkingLevel;
+		public TurnUpdate(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
+			this.context = context; this.model = model; this.thinkingLevel = thinkingLevel;
+		}
+		public AgentContext context() { return context; }
+		public Model model() { return model; }
+		public ThinkingLevel thinkingLevel() { return thinkingLevel; }
+		@Override protected String[] componentNames() { return new String[] {"context", "model", "thinkingLevel"}; }
+		@Override protected Object[] componentValues() { return new Object[] {context, model, thinkingLevel}; }
+	}
 
 	/** Result of {@link BeforeToolCall}. {@code block=true} prevents execution. */
-	public record BeforeResult(Boolean block, String reason, Boolean terminate) {
+	public static final class BeforeResult extends ValueObject {
+		private final Boolean block;
+		private final String reason;
+		private final Boolean terminate;
+		public BeforeResult(Boolean block, String reason, Boolean terminate) {
+			this.block = block; this.reason = reason; this.terminate = terminate;
+		}
+		public Boolean block() { return block; }
+		public String reason() { return reason; }
+		public Boolean terminate() { return terminate; }
+		@Override protected String[] componentNames() { return new String[] {"block", "reason", "terminate"}; }
+		@Override protected Object[] componentValues() { return new Object[] {block, reason, terminate}; }
 		public boolean blocked() {
 			return block != null && block;
 		}
@@ -92,12 +159,23 @@ public final class AgentLoopConfig {
 	 * Partial override returned from {@link AfterToolCall}. Non-null fields replace the executed
 	 * tool result's corresponding field; there is no deep merge (matches TypeScript semantics).
 	 */
-	public record AfterResult(
-			List<Content> content,
-			Object details,
-			Usage usage,
-			Boolean isError,
-			Boolean terminate) {}
+	public static final class AfterResult extends ValueObject {
+		private final List<Content> content;
+		private final Object details;
+		private final Usage usage;
+		private final Boolean isError;
+		private final Boolean terminate;
+		public AfterResult(List<Content> content, Object details, Usage usage, Boolean isError, Boolean terminate) {
+			this.content = content; this.details = details; this.usage = usage; this.isError = isError; this.terminate = terminate;
+		}
+		public List<Content> content() { return content; }
+		public Object details() { return details; }
+		public Usage usage() { return usage; }
+		public Boolean isError() { return isError; }
+		public Boolean terminate() { return terminate; }
+		@Override protected String[] componentNames() { return new String[] {"content", "details", "usage", "isError", "terminate"}; }
+		@Override protected Object[] componentValues() { return new Object[] {content, details, usage, isError, terminate}; }
+	}
 
 	// ───────────────────────── hook functional interfaces ─────────────────────────
 

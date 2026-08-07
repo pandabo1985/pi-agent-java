@@ -1,6 +1,7 @@
 package com.duokanbook.pi.agent;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -59,7 +60,7 @@ public final class Agent {
 		// Mirrors the TS original: replaced wholesale (copy-on-write) on each mutation rather than
 		// mutated in place, so an external thread reading this reference always sees a stable,
 		// unmodifiable snapshot instead of racing with processEvents()'s add/remove.
-		public volatile Set<String> pendingToolCalls = Set.of();
+		public volatile Set<String> pendingToolCalls = Collections.emptySet();
 		public volatile String errorMessage = null;
 
 		public List<AgentTool> tools() {
@@ -110,9 +111,17 @@ public final class Agent {
 	public PrepareNextTurnHook prepareNextTurn = null;
 	public PrepareNextTurnWithContextHook prepareNextTurnWithContext = null;
 	public String sessionId = null;
+	public Double temperature = null;
+	public java.util.Map<String, Object> samplingParams = null;
+	public Long maxTokens = null;
+	public String cacheRetention = null;
+	public java.util.Map<String, String> headers = null;
+	public java.util.Map<String, Object> metadata = null;
 	public Object thinkingBudgets = null;
 	public String transport = "auto";
 	public Long maxRetryDelayMs = null;
+	public SimpleStreamOptions.OnPayload onPayload = null;
+	public SimpleStreamOptions.OnResponse onResponse = null;
 	public ToolExecutionMode toolExecution = ToolExecutionMode.PARALLEL;
 
 	private volatile ActiveRun activeRun = null;
@@ -141,9 +150,17 @@ public final class Agent {
 		public QueueMode steeringMode = QueueMode.ONE_AT_A_TIME;
 		public QueueMode followUpMode = QueueMode.ONE_AT_A_TIME;
 		public String sessionId = null;
+		public Double temperature = null;
+		public java.util.Map<String, Object> samplingParams = null;
+		public Long maxTokens = null;
+		public String cacheRetention = null;
+		public java.util.Map<String, String> headers = null;
+		public java.util.Map<String, Object> metadata = null;
 		public Object thinkingBudgets = null;
 		public String transport = "auto";
 		public Long maxRetryDelayMs = null;
+		public SimpleStreamOptions.OnPayload onPayload = null;
+		public SimpleStreamOptions.OnResponse onResponse = null;
 		public ToolExecutionMode toolExecution = ToolExecutionMode.PARALLEL;
 	}
 
@@ -166,9 +183,17 @@ public final class Agent {
 		steeringQueue.mode = o.steeringMode;
 		followUpQueue.mode = o.followUpMode;
 		sessionId = o.sessionId;
+		temperature = o.temperature;
+		samplingParams = o.samplingParams;
+		maxTokens = o.maxTokens;
+		cacheRetention = o.cacheRetention;
+		headers = o.headers;
+		metadata = o.metadata;
 		thinkingBudgets = o.thinkingBudgets;
 		transport = o.transport;
 		maxRetryDelayMs = o.maxRetryDelayMs;
+		onPayload = o.onPayload;
+		onResponse = o.onResponse;
 		toolExecution = o.toolExecution;
 	}
 
@@ -250,7 +275,7 @@ public final class Agent {
 		state.messages.clear();
 		state.isStreaming = false;
 		state.streamingMessage = null;
-		state.pendingToolCalls = Set.of();
+		state.pendingToolCalls = Collections.emptySet();
 		state.errorMessage = null;
 		clearAllQueues();
 	}
@@ -258,11 +283,19 @@ public final class Agent {
 	// ───────────────────────── prompt / continue ─────────────────────────
 
 	public CompletableFuture<Void> prompt(String text) {
-		return prompt(List.<AgentMessage>of(new AgentMessage.UserMessage(text)));
+		return prompt(text, Collections.<Content.Image>emptyList());
+	}
+
+	/** Start a text prompt with zero or more image content blocks. */
+	public CompletableFuture<Void> prompt(String text, List<Content.Image> images) {
+		List<Content> content = new ArrayList<>();
+		content.add(new Content.Text(text));
+		if (images != null) content.addAll(images);
+		return prompt(new AgentMessage.UserMessage(content, System.currentTimeMillis()));
 	}
 
 	public CompletableFuture<Void> prompt(AgentMessage message) {
-		return prompt(List.of(message));
+		return prompt(Collections.singletonList(message));
 	}
 
 	public CompletableFuture<Void> prompt(List<AgentMessage> messages) {
@@ -317,9 +350,17 @@ public final class Agent {
 		c.model = state.model;
 		c.reasoning = state.thinkingLevel == ThinkingLevel.OFF ? null : state.thinkingLevel;
 		c.sessionId = sessionId;
+		c.temperature = temperature;
+		c.samplingParams = samplingParams;
+		c.maxTokens = maxTokens;
+		c.cacheRetention = cacheRetention;
+		c.headers = headers;
+		c.metadata = metadata;
 		c.transport = transport;
 		c.thinkingBudgets = thinkingBudgets;
 		c.maxRetryDelayMs = maxRetryDelayMs;
+		c.onPayload = onPayload;
+		c.onResponse = onResponse;
 		c.toolExecution = toolExecution;
 		c.convertToLlm = convertToLlm != null ? convertToLlm : DEFAULT_CONVERT_TO_LLM;
 		c.transformContext = transformContext;
@@ -345,7 +386,7 @@ public final class Agent {
 		c.getSteeringMessages = () -> {
 			if (skip[0]) {
 				skip[0] = false;
-				return CompletableFuture.completedFuture(List.of());
+				return CompletableFuture.completedFuture(Collections.<AgentMessage>emptyList());
 			}
 			return CompletableFuture.completedFuture(steeringQueue.drain());
 		};
@@ -387,7 +428,7 @@ public final class Agent {
 	private void handleRunFailure(Throwable error, boolean aborted) {
 		try {
 			AgentMessage.AssistantMessage failure = new AgentMessage.AssistantMessage(
-					List.of(new Content.Text("")),
+					Collections.<Content>singletonList(new Content.Text("")),
 					state.model.api(), state.model.provider(), state.model.id(),
 					Usage.empty(),
 					aborted ? StopReason.ABORTED : StopReason.ERROR,
@@ -395,8 +436,8 @@ public final class Agent {
 					System.currentTimeMillis());
 			processEvents(new AgentEvent.MessageStart(failure));
 			processEvents(new AgentEvent.MessageEnd(failure));
-			processEvents(new AgentEvent.TurnEnd(failure, List.of()));
-			processEvents(new AgentEvent.AgentEnd(List.of(failure)));
+			processEvents(new AgentEvent.TurnEnd(failure, Collections.<AgentMessage.ToolResultMessage>emptyList()));
+			processEvents(new AgentEvent.AgentEnd(Collections.<AgentMessage>singletonList(failure)));
 		} catch (Throwable ignored) {
 			// Best-effort: ensure finishRun() still runs and the idle future resolves.
 		}
@@ -405,7 +446,7 @@ public final class Agent {
 	private void finishRun() {
 		state.isStreaming = false;
 		state.streamingMessage = null;
-		state.pendingToolCalls = Set.of();
+		state.pendingToolCalls = Collections.emptySet();
 		ActiveRun run = activeRun;
 		activeRun = null;
 		if (run != null) run.done.complete(null);
@@ -413,31 +454,30 @@ public final class Agent {
 
 	/** Reduce internal state for an event, then await listeners (synchronized: serializes parallel tool emits). */
 	private synchronized void processEvents(AgentEvent event) throws Exception {
-		switch (event.type()) {
-			case "message_start" -> state.streamingMessage = ((AgentEvent.MessageStart) event).message();
-			case "message_update" -> state.streamingMessage = ((AgentEvent.MessageUpdate) event).message();
-			case "message_end" -> {
-				state.streamingMessage = null;
-				state.messages.add(((AgentEvent.MessageEnd) event).message());
+		String type = event.type();
+		if ("message_start".equals(type)) {
+			state.streamingMessage = ((AgentEvent.MessageStart) event).message();
+		} else if ("message_update".equals(type)) {
+			state.streamingMessage = ((AgentEvent.MessageUpdate) event).message();
+		} else if ("message_end".equals(type)) {
+			state.streamingMessage = null;
+			state.messages.add(((AgentEvent.MessageEnd) event).message());
+		} else if ("tool_execution_start".equals(type)) {
+			Set<String> next = new HashSet<String>(state.pendingToolCalls);
+			next.add(((AgentEvent.ToolExecutionStart) event).toolCallId());
+			state.pendingToolCalls = next;
+		} else if ("tool_execution_end".equals(type)) {
+			Set<String> next = new HashSet<String>(state.pendingToolCalls);
+			next.remove(((AgentEvent.ToolExecutionEnd) event).toolCallId());
+			state.pendingToolCalls = next;
+		} else if ("turn_end".equals(type)) {
+			AgentMessage message = ((AgentEvent.TurnEnd) event).message();
+			if (message instanceof AgentMessage.AssistantMessage) {
+				AgentMessage.AssistantMessage assistant = (AgentMessage.AssistantMessage) message;
+				if (assistant.errorMessage() != null) state.errorMessage = assistant.errorMessage();
 			}
-			case "tool_execution_start" -> {
-				Set<String> next = new HashSet<>(state.pendingToolCalls);
-				next.add(((AgentEvent.ToolExecutionStart) event).toolCallId());
-				state.pendingToolCalls = next;
-			}
-			case "tool_execution_end" -> {
-				Set<String> next = new HashSet<>(state.pendingToolCalls);
-				next.remove(((AgentEvent.ToolExecutionEnd) event).toolCallId());
-				state.pendingToolCalls = next;
-			}
-			case "turn_end" -> {
-				AgentMessage m = ((AgentEvent.TurnEnd) event).message();
-				if (m instanceof AgentMessage.AssistantMessage a && a.errorMessage() != null) {
-					state.errorMessage = a.errorMessage();
-				}
-			}
-			case "agent_end" -> state.streamingMessage = null;
-			default -> { /* agent_start, turn_start: no state change */ }
+		} else if ("agent_end".equals(type)) {
+			state.streamingMessage = null;
 		}
 
 		AbortSignal signal = activeRun != null ? activeRun.signal : null;
@@ -470,9 +510,9 @@ public final class Agent {
 				messages.clear();
 				return drained;
 			}
-			if (messages.isEmpty()) return List.of();
+			if (messages.isEmpty()) return Collections.emptyList();
 			AgentMessage first = messages.remove(0);
-			return new ArrayList<>(List.of(first));
+			return new ArrayList<AgentMessage>(Collections.singletonList(first));
 		}
 
 		void clear() {

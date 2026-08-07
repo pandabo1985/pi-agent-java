@@ -65,6 +65,8 @@ public final class AbortSignal {
 
 	/** Raised by {@link #check()} and by abort-aware operations. */
 	public static final class AbortedException extends RuntimeException {
+		private static final long serialVersionUID = 1L;
+
 		public AbortedException(String message) {
 			super(message);
 		}

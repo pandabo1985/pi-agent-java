@@ -10,7 +10,7 @@ import java.util.concurrent.LinkedBlockingQueue;
  * An async, single-consumer stream of events that also carries a final result,
  * the Java analogue of {@code pi-ai}'s {@code EventStream<TEvent, TResult>}.
  *
- * <p>Producer side ({@code push}/{@code end}): runs on a virtual thread (e.g. an
+ * <p>Producer side ({@code push}/{@code end}): runs on a background thread (e.g. an
  * HTTP reader). Pushes events in order, then completes with a terminal result via
  * {@link #end(Object)} (success) or {@link #completeExceptionally(Throwable)}.
  *

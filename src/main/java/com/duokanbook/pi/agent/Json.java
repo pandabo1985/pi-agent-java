@@ -56,14 +56,15 @@ public final class Json {
 			skipWs();
 			if (pos >= src.length()) throw new IllegalArgumentException("Unexpected end of JSON");
 			char c = src.charAt(pos);
-			return switch (c) {
-				case '{' -> parseObject();
-				case '[' -> parseArray();
-				case '"' -> parseString();
-				case 't', 'f' -> parseBool();
-				case 'n' -> parseNull();
-				default -> parseNumber();
-			};
+			switch (c) {
+				case '{': return parseObject();
+				case '[': return parseArray();
+				case '"': return parseString();
+				case 't':
+				case 'f': return parseBool();
+				case 'n': return parseNull();
+				default: return parseNumber();
+			}
 		}
 
 		Map<String, Object> parseObject() {
@@ -114,21 +115,21 @@ public final class Json {
 					if (pos >= src.length()) throw new IllegalArgumentException("Unterminated escape");
 					char e = src.charAt(pos++);
 					switch (e) {
-						case '"' -> sb.append('"');
-						case '\\' -> sb.append('\\');
-						case '/' -> sb.append('/');
-						case 'b' -> sb.append('\b');
-						case 'f' -> sb.append('\f');
-						case 'n' -> sb.append('\n');
-						case 'r' -> sb.append('\r');
-						case 't' -> sb.append('\t');
-						case 'u' -> {
+						case '"': sb.append('"'); break;
+						case '\\': sb.append('\\'); break;
+						case '/': sb.append('/'); break;
+						case 'b': sb.append('\b'); break;
+						case 'f': sb.append('\f'); break;
+						case 'n': sb.append('\n'); break;
+						case 'r': sb.append('\r'); break;
+						case 't': sb.append('\t'); break;
+						case 'u':
 							if (pos + 4 > src.length()) throw new IllegalArgumentException("Bad \\u escape");
 							int cp = Integer.parseInt(src.substring(pos, pos + 4), 16);
 							sb.append((char) cp);
 							pos += 4;
-						}
-						default -> throw new IllegalArgumentException("Bad escape \\" + e);
+							break;
+						default: throw new IllegalArgumentException("Bad escape \\" + e);
 					}
 				} else {
 					sb.append(c);
@@ -176,9 +177,10 @@ public final class Json {
 	@SuppressWarnings("unchecked")
 	private static void write(StringBuilder sb, Object v) {
 		if (v == null) { sb.append("null"); return; }
-		if (v instanceof String s) { writeString(sb, s); return; }
-		if (v instanceof Boolean b) { sb.append(b.booleanValue()); return; }
-		if (v instanceof Number n) {
+		if (v instanceof String) { writeString(sb, (String) v); return; }
+		if (v instanceof Boolean) { sb.append(((Boolean) v).booleanValue()); return; }
+		if (v instanceof Number) {
+			Number n = (Number) v;
 			double d = n.doubleValue();
 			if (Double.isNaN(d) || Double.isInfinite(d)) { sb.append("null"); return; }
 			if (d == Math.rint(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
@@ -188,7 +190,8 @@ public final class Json {
 			}
 			return;
 		}
-		if (v instanceof Map<?, ?> m) {
+		if (v instanceof Map<?, ?>) {
+			Map<?, ?> m = (Map<?, ?>) v;
 			sb.append('{');
 			boolean first = true;
 			for (Map.Entry<?, ?> e : m.entrySet()) {
@@ -201,7 +204,8 @@ public final class Json {
 			sb.append('}');
 			return;
 		}
-		if (v instanceof Iterable<?> it) {
+		if (v instanceof Iterable<?>) {
+			Iterable<?> it = (Iterable<?>) v;
 			sb.append('[');
 			boolean first = true;
 			for (Object o : it) {
@@ -220,22 +224,18 @@ public final class Json {
 		sb.append('"');
 		for (int i = 0; i < s.length(); i++) {
 			char c = s.charAt(i);
-			switch (c) {
-				case '"' -> sb.append("\\\"");
-				case '\\' -> sb.append("\\\\");
-				case '\n' -> sb.append("\\n");
-				case '\r' -> sb.append("\\r");
-				case '\t' -> sb.append("\\t");
-				case '\b' -> sb.append("\\b");
-				case '\f' -> sb.append("\\f");
-				default -> {
-					if (c < 0x20) {
-						sb.append(String.format("\\u%04x", (int) c));
-					} else {
-						sb.append(c);
-					}
+				switch (c) {
+					case '"': sb.append("\\\""); break;
+					case '\\': sb.append("\\\\"); break;
+					case '\n': sb.append("\\n"); break;
+					case '\r': sb.append("\\r"); break;
+					case '\t': sb.append("\\t"); break;
+					case '\b': sb.append("\\b"); break;
+					case '\f': sb.append("\\f"); break;
+					default:
+						if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+						else sb.append(c);
 				}
-			}
 		}
 		sb.append('"');
 	}
@@ -253,7 +253,7 @@ public final class Json {
 	 * {@code toolcall_end}.
 	 */
 	public static Object parseStreamingJson(String src) {
-		if (src == null || src.isBlank()) return new LinkedHashMap<String, Object>();
+		if (src == null || src.trim().isEmpty()) return new LinkedHashMap<String, Object>();
 		try {
 			return parse(src);
 		} catch (RuntimeException ignored) {

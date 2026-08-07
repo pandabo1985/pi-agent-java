@@ -1,86 +1,113 @@
 package com.duokanbook.pi.agent;
 
-/**
- * Streaming protocol events produced by a {@link StreamFn}, equivalent to
- * {@code pi-ai}'s {@code AssistantMessageEventStream}. Each event carries the cumulative
- * {@code partial} assistant message (a fresh immutable snapshot per event), so consumers
- * never need to mutate shared state.
- *
- * <p>Event sequence: {@code start} → (text|thinking|toolcall) start/delta/end* → {@code done|error}.
- */
-public sealed interface AssistantMessageEvent
-		permits AssistantMessageEvent.Start, AssistantMessageEvent.TextStart,
-				AssistantMessageEvent.TextDelta, AssistantMessageEvent.TextEnd,
-				AssistantMessageEvent.ThinkingStart, AssistantMessageEvent.ThinkingDelta,
-				AssistantMessageEvent.ThinkingEnd, AssistantMessageEvent.ToolCallStart,
-				AssistantMessageEvent.ToolCallDelta, AssistantMessageEvent.ToolCallEnd,
-				AssistantMessageEvent.Done, AssistantMessageEvent.ErrorEvent {
+/** Streaming protocol events produced by a {@link StreamFn}. */
+public interface AssistantMessageEvent {
 
-	/** Wire discriminator ({@code "start"}, {@code "text_delta"}, {@code "done"}, ...). */
 	String type();
-
-	/** Cumulative assistant message at the moment this event was emitted. */
 	AgentMessage.AssistantMessage partialMessage();
 
-	record Start(AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	abstract class PartialEvent extends ValueObject implements AssistantMessageEvent {
+		private final AgentMessage.AssistantMessage partial;
+		PartialEvent(AgentMessage.AssistantMessage partial) { this.partial = partial; }
+		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+	}
+	final class Start extends PartialEvent {
+		public Start(AgentMessage.AssistantMessage partial) { super(partial); }
 		@Override public String type() { return "start"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {partialMessage()}; }
 	}
-
-	record TextStart(int contentIndex, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	abstract class IndexedEvent extends PartialEvent {
+		private final int contentIndex;
+		IndexedEvent(int contentIndex, AgentMessage.AssistantMessage partial) { super(partial); this.contentIndex = contentIndex; }
+		public int contentIndex() { return contentIndex; }
+	}
+	final class TextStart extends IndexedEvent {
+		public TextStart(int contentIndex, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); }
 		@Override public String type() { return "text_start"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), partialMessage()}; }
 	}
-
-	record TextDelta(int contentIndex, String delta, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class TextDelta extends IndexedEvent {
+		private final String delta;
+		public TextDelta(int contentIndex, String delta, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); this.delta = delta; }
+		public String delta() { return delta; }
 		@Override public String type() { return "text_delta"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "delta", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), delta, partialMessage()}; }
 	}
-
-	record TextEnd(int contentIndex, String content, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class TextEnd extends IndexedEvent {
+		private final String content;
+		public TextEnd(int contentIndex, String content, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); this.content = content; }
+		public String content() { return content; }
 		@Override public String type() { return "text_end"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "content", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), content, partialMessage()}; }
 	}
-
-	record ThinkingStart(int contentIndex, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class ThinkingStart extends IndexedEvent {
+		public ThinkingStart(int contentIndex, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); }
 		@Override public String type() { return "thinking_start"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), partialMessage()}; }
 	}
-
-	record ThinkingDelta(int contentIndex, String delta, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class ThinkingDelta extends IndexedEvent {
+		private final String delta;
+		public ThinkingDelta(int contentIndex, String delta, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); this.delta = delta; }
+		public String delta() { return delta; }
 		@Override public String type() { return "thinking_delta"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "delta", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), delta, partialMessage()}; }
 	}
-
-	record ThinkingEnd(int contentIndex, String content, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class ThinkingEnd extends IndexedEvent {
+		private final String content;
+		public ThinkingEnd(int contentIndex, String content, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); this.content = content; }
+		public String content() { return content; }
 		@Override public String type() { return "thinking_end"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "content", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), content, partialMessage()}; }
 	}
-
-	record ToolCallStart(int contentIndex, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class ToolCallStart extends IndexedEvent {
+		public ToolCallStart(int contentIndex, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); }
 		@Override public String type() { return "toolcall_start"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), partialMessage()}; }
 	}
-
-	record ToolCallDelta(int contentIndex, String delta, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class ToolCallDelta extends IndexedEvent {
+		private final String delta;
+		public ToolCallDelta(int contentIndex, String delta, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); this.delta = delta; }
+		public String delta() { return delta; }
 		@Override public String type() { return "toolcall_delta"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "delta", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), delta, partialMessage()}; }
 	}
-
-	record ToolCallEnd(int contentIndex, AgentMessage.AssistantMessage partial) implements AssistantMessageEvent {
+	final class ToolCallEnd extends IndexedEvent {
+		public ToolCallEnd(int contentIndex, AgentMessage.AssistantMessage partial) { super(contentIndex, partial); }
 		@Override public String type() { return "toolcall_end"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return partial; }
+		@Override protected String[] componentNames() { return new String[] {"contentIndex", "partial"}; }
+		@Override protected Object[] componentValues() { return new Object[] {contentIndex(), partialMessage()}; }
 	}
-
-	/** Terminal: streaming completed normally. {@link #partialMessage()} returns the final message. */
-	record Done(StopReason reason, AgentMessage.AssistantMessage message) implements AssistantMessageEvent {
+	final class Done extends PartialEvent {
+		private final StopReason reason;
+		public Done(StopReason reason, AgentMessage.AssistantMessage message) { super(message); this.reason = reason; }
+		public StopReason reason() { return reason; }
+		public AgentMessage.AssistantMessage message() { return partialMessage(); }
 		@Override public String type() { return "done"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return message; }
+		@Override protected String[] componentNames() { return new String[] {"reason", "message"}; }
+		@Override protected Object[] componentValues() { return new Object[] {reason, message()}; }
 	}
-
-	/** Terminal: streaming failed or was aborted. {@link #partialMessage()} returns the final message. */
-	record ErrorEvent(StopReason reason, String errorMessage, AgentMessage.AssistantMessage message) implements AssistantMessageEvent {
+	final class ErrorEvent extends PartialEvent {
+		private final StopReason reason;
+		private final String errorMessage;
+		public ErrorEvent(StopReason reason, String errorMessage, AgentMessage.AssistantMessage message) {
+			super(message);
+			this.reason = reason;
+			this.errorMessage = errorMessage;
+		}
+		public StopReason reason() { return reason; }
+		public String errorMessage() { return errorMessage; }
+		public AgentMessage.AssistantMessage message() { return partialMessage(); }
 		@Override public String type() { return "error"; }
-		@Override public AgentMessage.AssistantMessage partialMessage() { return message; }
+		@Override protected String[] componentNames() { return new String[] {"reason", "errorMessage", "message"}; }
+		@Override protected Object[] componentValues() { return new Object[] {reason, errorMessage, message()}; }
 	}
 }

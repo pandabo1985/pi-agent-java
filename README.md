@@ -1,6 +1,6 @@
 # pi-agent-java
 
-A standalone, dependency-free **Java 17** port of the **core runtime** of the TypeScript package
+A standalone, dependency-free **Java 8** port of the **core runtime** of the TypeScript package
 `@earendil-works/pi-agent-core` — the general-purpose LLM agent with transport abstraction,
 state management, and tool execution.
 
@@ -18,10 +18,10 @@ underlying principles; this README covers the Java specifics.
 - The stateful `Agent` wrapper — transcript ownership, lifecycle events, queues, abort,
   `waitForIdle`, synthesized error messages on failure.
 - The full type model — `AgentMessage`, `Content`, `AgentEvent`, `AssistantMessageEvent`,
-  `Usage`, `Model`, `StopReason`, etc. (Java `sealed` interfaces + `record`s).
+  `Usage`, `Model`, `StopReason`, etc. (Java 8 interfaces and immutable value classes).
 - The stream abstraction — `StreamFn`, `EventStream`, `AbortSignal`, `DefaultStreamFn`.
 - `ProxyStreamFn` — SSE proxy client (bandwidth-optimized events → reconstructed partial),
-  using `java.net.http.HttpClient`.
+  using `HttpURLConnection`.
 - `Json` — a dependency-free JSON parser/serializer + streaming-JSON salvage.
 - A demo (`Main`) exercising the loop with an in-memory fake stream function and a sample tool.
 
@@ -37,7 +37,7 @@ reusable heart you can build either set of features against.
 
 ## Build & run
 
-Requires JDK 17+ and Maven 3.6+.
+Requires JDK 8+ and Maven 3.6+.
 
 ```bash
 cd pi-agent-java
@@ -68,7 +68,7 @@ Expected demo output (abridged):
 
 ```java
 import com.duokanbook.pi.agent.*;
-import java.util.List;
+import java.util.Collections;
 
 Model model = new Model("claude-sonnet-5", "Claude Sonnet 5", "anthropic", "anthropic",
         "https://api.anthropic.com", true, 200_000, 64_000, new Usage.Cost(0,0,0,0,0));
@@ -76,14 +76,18 @@ Model model = new Model("claude-sonnet-5", "Claude Sonnet 5", "anthropic", "anth
 Agent.AgentOptions opts = new Agent.AgentOptions();
 opts.model = model;
 opts.systemPrompt = "You are a helpful assistant.";
-opts.tools = List.of(new MyTool());
+opts.tools = Collections.<AgentTool>singletonList(new MyTool());
 opts.streamFn = new ProxyStreamFn("https://your-proxy.example.com", () -> authToken); // or your own StreamFn
 Agent agent = new Agent(opts);
 
 agent.subscribe((event, signal) -> {
-    if (event instanceof AgentEvent.MessageUpdate u
-            && u.assistantMessageEvent() instanceof AssistantMessageEvent.TextDelta d) {
-        System.out.print(d.delta());          // stream text deltas
+    if (event instanceof AgentEvent.MessageUpdate) {
+        AgentEvent.MessageUpdate update = (AgentEvent.MessageUpdate) event;
+        if (update.assistantMessageEvent() instanceof AssistantMessageEvent.TextDelta) {
+            AssistantMessageEvent.TextDelta delta =
+                    (AssistantMessageEvent.TextDelta) update.assistantMessageEvent();
+            System.out.print(delta.delta());  // stream text deltas
+        }
     }
 });
 
@@ -101,7 +105,7 @@ terminal `AssistantMessageEvent.ErrorEvent` whose message has `stopReason = ABOR
 |----------------------------------------------|----------------------------------------------------|
 | `agent-loop.ts` `runLoop`/`streamAssistantResponse` | `AgentLoop`                                  |
 | `agent.ts` `Agent`                           | `Agent`                                            |
-| `types.ts` `AgentMessage`/`AgentEvent`/`AgentLoopConfig` | `AgentMessage`/`AgentEvent`/`AgentLoopConfig` (sealed + records) |
+| `types.ts` `AgentMessage`/`AgentEvent`/`AgentLoopConfig` | `AgentMessage`/`AgentEvent`/`AgentLoopConfig` (interfaces + value classes) |
 | `types.ts` `StreamFn`                        | `StreamFn`                                         |
 | `stream-fn.ts`                               | `DefaultStreamFn`                                  |
 | `proxy.ts` `streamProxy`                     | `ProxyStreamFn`                                    |
@@ -110,21 +114,19 @@ terminal `AssistantMessageEvent.ErrorEvent` whose message has `stopReason = ABOR
 
 ## Design notes (deliberate choices for the Java port)
 
-- **Java 17 LTS, zero external dependencies.** `sealed` interfaces + `record`s model the
-  message/event unions with exhaustive `instanceof`/discriminator switching. Concurrency uses
-  `ExecutorService` + `CompletableFuture` (no virtual threads); upgrading to Java 21 virtual
-  threads is a mechanical change in `Agent`/`AgentLoop`.
+- **Java 8, zero external dependencies.** Interfaces and immutable value classes model the
+  message/event unions. Concurrency uses `ExecutorService` + `CompletableFuture`.
 - **Async = background thread + `CompletableFuture`.** TS `async/await` maps to a run thread that
   `.join()`s hook futures. `Agent.prompt` returns a `CompletableFuture<Void>` resolving after
   `agent_end` listeners settle.
 - **Event processing is synchronized** in `Agent.processEvents`, so the concurrent
   `tool_execution_end` emissions of a parallel tool batch serialize (mirroring JS's
   single-threaded event ordering).
-- **`AgentMessage` collapses the TS `Message | AgentMessage` split** into one sealed hierarchy
-  (`User/Assistant/ToolResult/Custom`). `convertToLlm` filters out `Custom`. To add a fully typed
-  custom message, add a new permitted record to `AgentMessage` (the only edit required).
+- **`AgentMessage` collapses the TS `Message | AgentMessage` split** into one hierarchy
+  (`User/Assistant/ToolResult/Custom`). `convertToLlm` filters out `Custom`. Add a class
+  implementing `AgentMessage` to introduce a fully typed custom message.
 - **Immutable snapshots per stream event.** Each `AssistantMessageEvent` carries a fresh
-  `AgentMessage.AssistantMessage` snapshot (records are immutable), so the proxy and direct
+  `AgentMessage.AssistantMessage` snapshot, so the proxy and direct
   producers never mutate shared state.
 - **`Json` is hand-rolled** (~250 lines) so the core stays provider- and library-free, matching
   the TS package's stance of not depending on a provider catalog.
@@ -139,11 +141,11 @@ pi-agent-java/
 └── src/main/java/com/duokanbook/pi/agent/
     ├── Agent.java                 # stateful wrapper (agent.ts)
     ├── AgentLoop.java             # the loop + tool execution (agent-loop.ts)
-    ├── AgentLoopConfig.java       # config + all hook contracts + context/result records
-    ├── AgentMessage.java          # sealed: User/Assistant/ToolResult/Custom
-    ├── AgentEvent.java            # sealed: lifecycle event union
-    ├── AssistantMessageEvent.java # sealed: stream-protocol event union
-    ├── Content.java               # sealed: Text/Image/Thinking/ToolCall
+    ├── AgentLoopConfig.java       # config + all hook contracts + context/result classes
+    ├── AgentMessage.java          # User/Assistant/ToolResult/Custom hierarchy
+    ├── AgentEvent.java            # lifecycle event hierarchy
+    ├── AssistantMessageEvent.java # stream-protocol event hierarchy
+    ├── Content.java               # Text/Image/Thinking/ToolCall hierarchy
     ├── EventStream.java           # async event stream + terminal result
     ├── AbortSignal.java           # cooperative cancellation
     ├── StreamFn.java              # the stream-function contract
