@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+		 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+		 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<groupId>com.duokanbook</groupId>
+	<artifactId>pi-agent-java</artifactId>
+	<version>0.84.1</version>
+	<packaging>jar</packaging>
+
+	<name>pi-agent-java</name>
+	<description>Java port of @earendil-works/pi-agent-core: general-purpose LLM agent with transport abstraction, state management, and tool execution.</description>
+
+	<properties>
+		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+		<!-- Targets Java 17 LTS (sealed interfaces + records, both stable since 17).
+		     No virtual threads / switch-type-patterns are used; concurrency uses
+		     ExecutorService + CompletableFuture. Forward-compatible with Java 21+. -->
+		<maven.compiler.release>17</maven.compiler.release>
+	</properties>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<version>3.13.0</version>
+				<configuration>
+					<release>17</release>
+					<compilerArgs>
+						<arg>-Xlint:all</arg>
+						<arg>-proc:none</arg>
+					</compilerArgs>
+				</configuration>
+			</plugin>
+			<!-- Convenience: `mvn exec:java` runs the demo Main with an in-memory stream function. -->
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>exec-maven-plugin</artifactId>
+				<version>3.3.0</version>
+				<configuration>
+					<mainClass>com.duokanbook.pi.agent.Main</mainClass>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
+</project>
