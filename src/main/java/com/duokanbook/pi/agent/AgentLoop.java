@@ -582,6 +582,8 @@ public final class AgentLoop {
 			});
 			AgentToolResult<?> result = awaitToolResult(future, config.toolTimeoutMs, signal, prepared.toolCall().name());
 			return new ExecutedToolCallOutcome(result, false);
+		} catch (AbortSignal.AbortedException e) {
+			throw e;
 		} catch (Throwable e) {
 			return new ExecutedToolCallOutcome(AgentToolResult.error(messageOf(e)), true);
 		} finally {

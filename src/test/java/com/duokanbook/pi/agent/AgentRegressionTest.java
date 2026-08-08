@@ -258,6 +258,38 @@ public class AgentRegressionTest {
 	}
 
 	@Test
+	public void abortDuringToolExecutionCancelsTheToolAndEndsWithoutAResultMessage() throws Exception {
+		CountDownLatch toolStarted = new CountDownLatch(1);
+		CompletableFuture<AgentToolResult<?>> neverCompletes = new CompletableFuture<>();
+		AtomicInteger streamCalls = new AtomicInteger();
+		AgentTool tool = tool("slow", signal -> {
+			toolStarted.countDown();
+			return neverCompletes;
+		});
+		Agent.AgentOptions options = new Agent.AgentOptions();
+		options.tools = Collections.singletonList(tool);
+		options.streamFn = (model, context, streamOptions) -> {
+			streamCalls.incrementAndGet();
+			return assistantStream(assistant(Collections.<Content>singletonList(
+					new Content.ToolCall("slow-id", "slow", Collections.<String, Object>emptyMap())), StopReason.TOOL_USE, null));
+		};
+		Agent agent = new Agent(options);
+
+		CompletableFuture<Void> run = agent.prompt("go");
+		assertTrue(toolStarted.await(2, TimeUnit.SECONDS));
+		agent.abort();
+		run.get(2, TimeUnit.SECONDS);
+
+		assertTrue(neverCompletes.isCancelled());
+		assertEquals(1, streamCalls.get());
+		for (AgentMessage message : agent.state().messages()) {
+			assertTrue("abort must not synthesize a tool result", !(message instanceof AgentMessage.ToolResultMessage));
+		}
+		AgentMessage.AssistantMessage failure = (AgentMessage.AssistantMessage) agent.state().messages().get(2);
+		assertEquals(StopReason.ABORTED, failure.stopReason());
+	}
+
+	@Test
 	public void abortSettlesTheAgentAndPublishedMessageSnapshotsStayStable() throws Exception {
 		CountDownLatch streamStarted = new CountDownLatch(1);
 		Agent.AgentOptions options = new Agent.AgentOptions();

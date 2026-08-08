@@ -20,7 +20,7 @@ import java.util.List;
  */
 public final class AbortSignal {
 
-	private boolean aborted = false;
+	private volatile boolean aborted = false;
 	private final List<Runnable> listeners = new ArrayList<>();
 
 	/** Returns {@code true} once {@link #abort()} has been called. */
@@ -65,7 +65,7 @@ public final class AbortSignal {
 
 	/** Throw {@link AbortedException} if this signal has been aborted. */
 	public void check() {
-		if (aborted) throw new AbortedException("Operation aborted");
+		if (isAborted()) throw new AbortedException("Operation aborted");
 	}
 
 	/** Raised by {@link #check()} and by abort-aware operations. */
