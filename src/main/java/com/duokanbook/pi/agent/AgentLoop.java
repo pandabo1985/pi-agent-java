@@ -5,8 +5,11 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
@@ -127,6 +130,7 @@ public final class AgentLoop {
 
 		AgentContext currentContext = initialContext;
 		boolean firstTurn = true;
+		int assistantTurns = 0;
 		// Steering messages may have arrived while the caller was waiting to start.
 		List<AgentMessage> pendingMessages = drainSteering(config);
 
@@ -136,6 +140,7 @@ public final class AgentLoop {
 
 			// Inner loop: consume tool calls and steering messages.
 			while (hasMoreToolCalls || !pendingMessages.isEmpty()) {
+				if (signal != null) signal.check();
 				if (!firstTurn) {
 					emit.emit(new AgentEvent.TurnStart());
 				} else {
@@ -153,9 +158,24 @@ public final class AgentLoop {
 					pendingMessages = new ArrayList<>();
 				}
 
+				if (config.maxTurns != null && config.maxTurns > 0 && assistantTurns >= config.maxTurns) {
+					AgentMessage.AssistantMessage failure = new AgentMessage.AssistantMessage(
+							Collections.<Content>singletonList(new Content.Text("Agent turn limit exceeded")),
+							config.model.api(), config.model.provider(), config.model.id(), Usage.empty(),
+							StopReason.ERROR, "Maximum assistant turns exceeded: " + config.maxTurns,
+							System.currentTimeMillis());
+					newMessages.add(failure);
+					emit.emit(new AgentEvent.MessageStart(failure));
+					emit.emit(new AgentEvent.MessageEnd(failure));
+					emit.emit(new AgentEvent.TurnEnd(failure, Collections.<AgentMessage.ToolResultMessage>emptyList()));
+					emit.emit(new AgentEvent.AgentEnd(newMessages));
+					return;
+				}
+
 				// Stream one assistant response.
 				AgentMessage.AssistantMessage message = streamAssistantResponse(
 						currentContext, config, signal, emit, streamFunction);
+				assistantTurns++;
 				newMessages.add(message);
 
 				if (message.stopReason() == StopReason.ERROR || message.stopReason() == StopReason.ABORTED) {
@@ -411,7 +431,7 @@ public final class AgentLoop {
 				finalized = new FinalizedToolCall(toolCall, imm.result(), imm.isError());
 			} else {
 				Prepared prepared = (Prepared) preparation;
-				ExecutedToolCallOutcome executed = executePrepared(prepared, signal, emit);
+				ExecutedToolCallOutcome executed = executePrepared(prepared, config, signal, emit);
 				finalized = finalizeExecuted(currentContext, assistantMessage, prepared, executed, config, signal);
 			}
 
@@ -455,7 +475,7 @@ public final class AgentLoop {
 
 			Prepared prepared = (Prepared) preparation;
 			entries.add(() -> {
-				ExecutedToolCallOutcome executed = executePrepared(prepared, signal, emit);
+				ExecutedToolCallOutcome executed = executePrepared(prepared, config, signal, emit);
 				FinalizedToolCall finalized = finalizeExecuted(currentContext, assistantMessage, prepared, executed, config, signal);
 				try {
 					emit.emit(new AgentEvent.ToolExecutionEnd(prepared.toolCall().id(), prepared.toolCall().name(),
@@ -537,32 +557,65 @@ public final class AgentLoop {
 				return new Immediate(AgentToolResult.error("Operation aborted"), true);
 			}
 			return new Prepared(toolCall, tool, validatedArgs);
+		} catch (AbortSignal.AbortedException e) {
+			throw e;
 		} catch (Throwable e) {
 			return new Immediate(AgentToolResult.error(messageOf(e)), true);
 		}
 	}
 
 	private static ExecutedToolCallOutcome executePrepared(
-			Prepared prepared, AbortSignal signal, EventSink emit) {
+			Prepared prepared, AgentLoopConfig config, AbortSignal signal, EventSink emit) {
 
 		AtomicBoolean accepting = new AtomicBoolean(true);
 		String id = prepared.toolCall().id();
 		String name = prepared.toolCall().name();
 		Object args = prepared.toolCall().arguments();
 		try {
-			AgentToolResult<?> result = prepared.tool().execute(id, prepared.args(), signal, partial -> {
+			CompletableFuture<AgentToolResult<?>> future = prepared.tool().execute(id, prepared.args(), signal, partial -> {
 				if (!accepting.get()) return;
 				try {
 					emit.emit(new AgentEvent.ToolExecutionUpdate(id, name, args, partial));
 				} catch (Exception e) {
 					throw new RuntimeException(e);
 				}
-			}).join();
+			});
+			AgentToolResult<?> result = awaitToolResult(future, config.toolTimeoutMs, signal, prepared.toolCall().name());
 			return new ExecutedToolCallOutcome(result, false);
 		} catch (Throwable e) {
 			return new ExecutedToolCallOutcome(AgentToolResult.error(messageOf(e)), true);
 		} finally {
 			accepting.set(false);
+		}
+	}
+
+	private static AgentToolResult<?> awaitToolResult(
+			CompletableFuture<AgentToolResult<?>> future, Long timeoutMs, AbortSignal signal, String toolName) throws Exception {
+		long deadline = timeoutMs != null && timeoutMs > 0 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs) : 0L;
+		while (true) {
+			if (signal != null && signal.isAborted()) {
+				future.cancel(true);
+				throw new AbortSignal.AbortedException("Operation aborted");
+			}
+			long waitMs = 100L;
+			if (deadline != 0L) {
+				long remainingNanos = deadline - System.nanoTime();
+				if (remainingNanos <= 0L) {
+					future.cancel(true);
+					throw new TimeoutException("Tool " + toolName + " timed out after " + timeoutMs + " ms");
+				}
+				waitMs = Math.min(waitMs, Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+			}
+			try {
+				return future.get(waitMs, TimeUnit.MILLISECONDS);
+			} catch (TimeoutException ignored) {
+				// Recheck abort and deadline without blocking the agent run indefinitely.
+			} catch (ExecutionException e) {
+				Throwable cause = e.getCause();
+				if (cause instanceof Exception) throw (Exception) cause;
+				if (cause instanceof Error) throw (Error) cause;
+				throw new RuntimeException(cause);
+			}
 		}
 	}
 
@@ -601,6 +654,8 @@ public final class AgentLoop {
 
 	private static AgentMessage.ToolResultMessage createToolResultMessage(FinalizedToolCall finalized) {
 		AgentToolResult<?> r = finalized.result();
+		// addedToolNames is retained for provider/deferred-tool consumers; the core loop does not
+		// mutate currentContext.tools because it has no registry from which to resolve names.
 		return new AgentMessage.ToolResultMessage(
 				finalized.toolCall().id(),
 				finalized.toolCall().name(),

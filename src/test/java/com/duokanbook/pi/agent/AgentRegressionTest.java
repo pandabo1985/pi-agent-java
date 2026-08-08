@@ -2,16 +2,23 @@ package com.duokanbook.pi.agent;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import com.sun.net.httpserver.HttpServer;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
 
 public class AgentRegressionTest {
@@ -137,6 +144,350 @@ public class AgentRegressionTest {
 		assertEquals(new AgentEvent.AgentStart(), new AgentEvent.AgentStart());
 		assertEquals(new Usage.Cost(1, 2, 3, 4, 10), new Usage.Cost(1, 2, 3, 4, 10));
 		assertEquals("key", new SimpleStreamOptions("key", null, null, null, "auto", null, null).apiKey());
+	}
+
+	@Test
+	public void parallelBatchEmitsToolEndsInCompletionOrderButToolResultsInSourceOrder() throws Exception {
+		CountDownLatch fastFinished = new CountDownLatch(1);
+		AtomicInteger streamCalls = new AtomicInteger();
+		List<String> executionEnds = Collections.synchronizedList(new ArrayList<String>());
+		List<String> resultMessages = Collections.synchronizedList(new ArrayList<String>());
+
+		AgentTool slow = tool("slow", signal -> {
+			CompletableFuture<AgentToolResult<?>> future = new CompletableFuture<>();
+			Thread worker = new Thread(() -> {
+				await(fastFinished);
+				future.complete(toolText("slow", true));
+			}, "test-slow-tool");
+			worker.setDaemon(true);
+			worker.start();
+			return future;
+		});
+		AgentTool fast = tool("fast", signal -> {
+			fastFinished.countDown();
+			return CompletableFuture.<AgentToolResult<?>>completedFuture(toolText("fast", true));
+		});
+
+		AgentLoopConfig config = loopConfig();
+		StreamFn stream = (model, context, options) -> {
+			streamCalls.incrementAndGet();
+			return assistantStream(assistant(Arrays.<Content>asList(
+					new Content.ToolCall("slow-id", "slow", Collections.<String, Object>emptyMap()),
+					new Content.ToolCall("fast-id", "fast", Collections.<String, Object>emptyMap())),
+					StopReason.TOOL_USE, null));
+		};
+
+		AgentLoop.runAgentLoop(Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("go")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Arrays.asList(slow, fast)), config, event -> {
+					if (event instanceof AgentEvent.ToolExecutionEnd) {
+						executionEnds.add(((AgentEvent.ToolExecutionEnd) event).toolCallId());
+					} else if (event instanceof AgentEvent.MessageEnd
+							&& ((AgentEvent.MessageEnd) event).message() instanceof AgentMessage.ToolResultMessage) {
+						resultMessages.add(((AgentMessage.ToolResultMessage) ((AgentEvent.MessageEnd) event).message()).toolCallId());
+					}
+				}, new AbortSignal(), stream);
+
+		assertEquals(1, streamCalls.get());
+		assertEquals(Arrays.asList("fast-id", "slow-id"), executionEnds);
+		assertEquals(Arrays.asList("slow-id", "fast-id"), resultMessages);
+	}
+
+	@Test
+	public void lengthTruncationDoesNotExecutePossiblyIncompleteToolCalls() throws Exception {
+		AtomicInteger executions = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.shouldStopAfterTurn = context -> CompletableFuture.completedFuture(Boolean.TRUE);
+		AgentTool tool = tool("write", signal -> {
+			executions.incrementAndGet();
+			return CompletableFuture.<AgentToolResult<?>>completedFuture(toolText("should not run", false));
+		});
+
+		List<AgentMessage> messages = AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("go")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.singletonList(tool)), config, event -> {},
+				new AbortSignal(), (model, context, options) -> assistantStream(assistant(
+						Collections.<Content>singletonList(new Content.ToolCall("cut", "write", Collections.<String, Object>emptyMap())),
+						StopReason.LENGTH, null)));
+
+		assertEquals(0, executions.get());
+		AgentMessage.ToolResultMessage result = (AgentMessage.ToolResultMessage) messages.get(2);
+		assertTrue(result.isError());
+		assertTrue(textOf(result.content()).contains("output token limit"));
+	}
+
+	@Test
+	public void maxTurnsStopsRepeatedToolUseBeforeAnotherModelRequest() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.maxTurns = 1;
+		AgentTool tool = tool("again", signal -> CompletableFuture.<AgentToolResult<?>>completedFuture(toolText("ok", false)));
+
+		List<AgentMessage> messages = AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("go")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.singletonList(tool)), config, event -> {},
+				new AbortSignal(), (model, context, options) -> {
+					streamCalls.incrementAndGet();
+					return assistantStream(assistant(Collections.<Content>singletonList(
+							new Content.ToolCall("again-id", "again", Collections.<String, Object>emptyMap())), StopReason.TOOL_USE, null));
+				});
+
+		assertEquals(1, streamCalls.get());
+		AgentMessage.AssistantMessage failure = (AgentMessage.AssistantMessage) messages.get(3);
+		assertEquals(StopReason.ERROR, failure.stopReason());
+		assertEquals("Maximum assistant turns exceeded: 1", failure.errorMessage());
+	}
+
+	@Test
+	public void toolTimeoutCancelsTheFutureAndProducesAnErrorResult() throws Exception {
+		CompletableFuture<AgentToolResult<?>> neverCompletes = new CompletableFuture<>();
+		AgentLoopConfig config = loopConfig();
+		config.toolTimeoutMs = 30L;
+		config.shouldStopAfterTurn = context -> CompletableFuture.completedFuture(Boolean.TRUE);
+		AgentTool tool = tool("slow", signal -> neverCompletes);
+
+		List<AgentMessage> messages = AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("go")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.singletonList(tool)), config, event -> {},
+				new AbortSignal(), (model, context, options) -> assistantStream(assistant(Collections.<Content>singletonList(
+						new Content.ToolCall("slow-id", "slow", Collections.<String, Object>emptyMap())), StopReason.TOOL_USE, null)));
+
+		assertTrue(neverCompletes.isCancelled());
+		AgentMessage.ToolResultMessage result = (AgentMessage.ToolResultMessage) messages.get(2);
+		assertTrue(result.isError());
+		assertTrue(textOf(result.content()).contains("timed out after 30 ms"));
+	}
+
+	@Test
+	public void abortSettlesTheAgentAndPublishedMessageSnapshotsStayStable() throws Exception {
+		CountDownLatch streamStarted = new CountDownLatch(1);
+		Agent.AgentOptions options = new Agent.AgentOptions();
+		options.streamFn = (model, context, streamOptions) -> {
+			EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> stream = new EventStream<>();
+			streamOptions.signal().addListener(() -> {
+				AgentMessage.AssistantMessage aborted = assistant(Collections.<Content>singletonList(new Content.Text("cancelled")),
+						StopReason.ABORTED, "cancelled");
+				stream.push(new AssistantMessageEvent.ErrorEvent(StopReason.ABORTED, "cancelled", aborted));
+				stream.end(aborted);
+			});
+			streamStarted.countDown();
+			return stream;
+		};
+		Agent agent = new Agent(options);
+
+		CompletableFuture<Void> run = agent.prompt("wait");
+		assertTrue(streamStarted.await(2, TimeUnit.SECONDS));
+		List<AgentMessage> snapshot = agent.state().messages();
+		assertEquals(1, snapshot.size());
+		try {
+			snapshot.add(new AgentMessage.UserMessage("mutate"));
+			fail("state messages must be immutable snapshots");
+		} catch (UnsupportedOperationException expected) {
+			// Expected.
+		}
+
+		agent.abort();
+		run.get(2, TimeUnit.SECONDS);
+		agent.waitForIdle().get(2, TimeUnit.SECONDS);
+		for (AgentMessage ignored : snapshot) {
+			// Iterating an earlier snapshot must not race with later publications.
+		}
+		assertEquals(1, snapshot.size());
+		assertEquals(2, agent.state().messages().size());
+		AgentMessage.AssistantMessage finalMessage = (AgentMessage.AssistantMessage) agent.state().messages().get(1);
+		assertEquals(StopReason.ABORTED, finalMessage.stopReason());
+		assertEquals("cancelled", agent.state().errorMessage);
+	}
+
+	@Test
+	public void steeringAndFollowUpsAreInjectedAndCustomMessagesStayOutOfLlmContext() throws Exception {
+		CountDownLatch firstRequest = new CountDownLatch(1);
+		CountDownLatch releaseFirstResponse = new CountDownLatch(1);
+		AtomicInteger calls = new AtomicInteger();
+		List<List<String>> visibleRoles = new CopyOnWriteArrayList<>();
+		Agent.AgentOptions options = new Agent.AgentOptions();
+		options.messages = Collections.<AgentMessage>singletonList(new AgentMessage.CustomMessage(
+				"internal", Collections.<String, Object>singletonMap("source", "test"), 1L));
+		options.streamFn = (model, context, streamOptions) -> {
+			List<String> roles = new ArrayList<>();
+			for (AgentMessage message : context.messages()) roles.add(message.role());
+			visibleRoles.add(roles);
+			int call = calls.incrementAndGet();
+			AgentMessage.AssistantMessage response = assistant(Collections.<Content>singletonList(
+					new Content.Text("response " + call)), StopReason.STOP, null);
+			if (call != 1) return assistantStream(response);
+
+			EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> stream = new EventStream<>();
+			stream.push(new AssistantMessageEvent.Start(response));
+			Thread worker = new Thread(() -> {
+				await(releaseFirstResponse);
+				stream.push(new AssistantMessageEvent.Done(StopReason.STOP, response));
+				stream.end(response);
+			}, "test-first-response");
+			worker.setDaemon(true);
+			worker.start();
+			firstRequest.countDown();
+			return stream;
+		};
+		Agent agent = new Agent(options);
+
+		CompletableFuture<Void> run = agent.prompt("original");
+		assertTrue(firstRequest.await(2, TimeUnit.SECONDS));
+		agent.steer(new AgentMessage.UserMessage("steered"));
+		agent.followUp(new AgentMessage.UserMessage("follow-up"));
+		releaseFirstResponse.countDown();
+		run.get(2, TimeUnit.SECONDS);
+
+		assertEquals(3, calls.get());
+		assertEquals(Collections.singletonList("user"), visibleRoles.get(0));
+		assertEquals(Arrays.asList("user", "assistant", "user"), visibleRoles.get(1));
+		assertEquals(Arrays.asList("user", "assistant", "user", "assistant", "user"), visibleRoles.get(2));
+	}
+
+	@Test
+	public void agentFailureIncludesAllNewMessagesAndErrorTextInTheTerminalPayload() throws Exception {
+		List<List<AgentMessage>> agentEnds = new CopyOnWriteArrayList<>();
+		Agent.AgentOptions options = new Agent.AgentOptions();
+		options.streamFn = (model, context, streamOptions) -> {
+			throw new IllegalStateException("provider exploded");
+		};
+		Agent agent = new Agent(options);
+		agent.subscribe((event, signal) -> {
+			if (event instanceof AgentEvent.AgentEnd) {
+				agentEnds.add(new ArrayList<>(((AgentEvent.AgentEnd) event).messages()));
+			}
+		});
+
+		agent.prompt("hello").get(2, TimeUnit.SECONDS);
+
+		assertEquals(1, agentEnds.size());
+		assertEquals(2, agentEnds.get(0).size());
+		AgentMessage.AssistantMessage failure = (AgentMessage.AssistantMessage) agentEnds.get(0).get(1);
+		assertEquals(StopReason.ERROR, failure.stopReason());
+		assertEquals("provider exploded", failure.errorMessage());
+		assertEquals("provider exploded", textOf(failure.content()));
+	}
+
+	@Test
+	public void proxyAcceptsDataFramesWithoutSpacesAndWithMultilineJson() throws Exception {
+		HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+		server.createContext("/api/stream", exchange -> {
+			byte[] response = ("event: message\n"
+					+ "id: 1\n"
+					+ "data:{\"type\":\"start\"}\n\n"
+					+ "data:{\"type\":\"done\",\"reason\":\n"
+					+ "data:\"stop\"}\n\n").getBytes(StandardCharsets.UTF_8);
+			exchange.sendResponseHeaders(200, 0);
+			OutputStream output = exchange.getResponseBody();
+			try { output.write(response); } finally { output.close(); }
+		});
+		server.start();
+		try {
+			ProxyStreamFn proxy = new ProxyStreamFn("http://127.0.0.1:" + server.getAddress().getPort(), "token");
+			AgentMessage.AssistantMessage result = proxy.stream(Model.unknown(),
+					new LlmContext("", Collections.<AgentMessage>emptyList(), Collections.<AgentTool>emptyList()),
+					SimpleStreamOptions.builder().build()).result().get(5, TimeUnit.SECONDS);
+			assertEquals(StopReason.STOP, result.stopReason());
+		} finally {
+			server.stop(0);
+		}
+	}
+
+	@Test
+	public void proxyDoesNotOpenARequestWhenTheSignalIsAlreadyAborted() throws Exception {
+		AtomicInteger requests = new AtomicInteger();
+		HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+		server.createContext("/api/stream", exchange -> requests.incrementAndGet());
+		server.start();
+		try {
+			AbortSignal signal = new AbortSignal();
+			signal.abort();
+			ProxyStreamFn proxy = new ProxyStreamFn("http://127.0.0.1:" + server.getAddress().getPort(), "token");
+			AgentMessage.AssistantMessage result = proxy.stream(Model.unknown(),
+					new LlmContext("", Collections.<AgentMessage>emptyList(), Collections.<AgentTool>emptyList()),
+					SimpleStreamOptions.builder().signal(signal).build()).result().get(2, TimeUnit.SECONDS);
+			assertEquals(StopReason.ABORTED, result.stopReason());
+			assertEquals(0, requests.get());
+		} finally {
+			server.stop(0);
+		}
+	}
+
+	@Test
+	public void jsonRejectsInvalidNumberForms() {
+		assertEquals(Double.valueOf(-1200.5), Json.parse("-12.005e2"));
+		for (String invalid : Arrays.asList("+1", "01", "1.", "1e", "-")) {
+			try {
+				Json.parse(invalid);
+				fail("expected invalid JSON number: " + invalid);
+			} catch (IllegalArgumentException expected) {
+				// Expected.
+			}
+		}
+	}
+
+	private static AgentLoopConfig loopConfig() {
+		AgentLoopConfig config = new AgentLoopConfig(Model.unknown(),
+				messages -> CompletableFuture.completedFuture(messages));
+		config.toolExecution = ToolExecutionMode.PARALLEL;
+		return config;
+	}
+
+	private static AgentTool tool(final String name, final ToolExecution execution) {
+		return new AgentTool() {
+			@Override public String name() { return name; }
+			@Override public String label() { return name; }
+			@Override public String description() { return name; }
+			@Override public Map<String, Object> parameters() { return null; }
+			@Override public CompletableFuture<AgentToolResult<?>> execute(
+					String toolCallId, Object args, AbortSignal signal,
+					java.util.function.Consumer<AgentToolResult<?>> onUpdate) {
+				return execution.execute(signal);
+			}
+		};
+	}
+
+	private static AgentToolResult<Object> toolText(String text, boolean terminate) {
+		return new AgentToolResult<Object>(Collections.<Content>singletonList(new Content.Text(text)), null,
+				null, null, terminate);
+	}
+
+	private static AgentMessage.AssistantMessage assistant(List<Content> content, StopReason reason, String errorMessage) {
+		return new AgentMessage.AssistantMessage(new ArrayList<>(content), "test", "test", "test", Usage.empty(),
+				reason, errorMessage, 1L);
+	}
+
+	private static EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> assistantStream(
+			AgentMessage.AssistantMessage message) {
+		EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> stream = new EventStream<>();
+		stream.push(new AssistantMessageEvent.Start(message));
+		if (message.stopReason() == StopReason.ERROR || message.stopReason() == StopReason.ABORTED) {
+			stream.push(new AssistantMessageEvent.ErrorEvent(message.stopReason(), message.errorMessage(), message));
+		} else {
+			stream.push(new AssistantMessageEvent.Done(message.stopReason(), message));
+		}
+		stream.end(message);
+		return stream;
+	}
+
+	private static String textOf(List<Content> content) {
+		for (Content block : content) {
+			if (block instanceof Content.Text) return ((Content.Text) block).text();
+		}
+		return "";
+	}
+
+	private static void await(CountDownLatch latch) {
+		try {
+			if (!latch.await(5, TimeUnit.SECONDS)) throw new AssertionError("timed out waiting for test coordination");
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError("interrupted while waiting for test coordination", e);
+		}
+	}
+
+	@FunctionalInterface
+	private interface ToolExecution {
+		CompletableFuture<AgentToolResult<?>> execute(AbortSignal signal);
 	}
 
 	private static Map<String, Object> schema(String type) {

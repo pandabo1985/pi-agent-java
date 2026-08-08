@@ -48,18 +48,17 @@ public final class Agent {
 		CompletableFuture<AgentLoopConfig.TurnUpdate> apply(AgentLoopConfig.TurnContext ctx, AbortSignal signal);
 	}
 
-	/** Mutable agent state. {@code tools}/{@code messages} setters copy their top-level list. */
+	/** Mutable agent state. {@code tools}/{@code messages} are published as immutable snapshots. */
 	public static final class State {
 		public String systemPrompt = "";
 		public Model model = Model.unknown();
 		public ThinkingLevel thinkingLevel = ThinkingLevel.OFF;
-		private List<AgentTool> tools = new ArrayList<>();
-		private List<AgentMessage> messages = new ArrayList<>();
+		private volatile List<AgentTool> tools = Collections.emptyList();
+		private volatile List<AgentMessage> messages = Collections.emptyList();
 		public volatile boolean isStreaming = false;
 		public volatile AgentMessage streamingMessage = null;
-		// Mirrors the TS original: replaced wholesale (copy-on-write) on each mutation rather than
-		// mutated in place, so an external thread reading this reference always sees a stable,
-		// unmodifiable snapshot instead of racing with processEvents()'s add/remove.
+		// Replaced wholesale (copy-on-write) on each mutation, so external readers see stable,
+		// unmodifiable snapshots instead of racing with processEvents().
 		public volatile Set<String> pendingToolCalls = Collections.emptySet();
 		public volatile String errorMessage = null;
 
@@ -68,7 +67,7 @@ public final class Agent {
 		}
 
 		public void setTools(List<AgentTool> next) {
-			tools = new ArrayList<>(next);
+			tools = Collections.unmodifiableList(new ArrayList<>(next));
 		}
 
 		public List<AgentMessage> messages() {
@@ -76,7 +75,7 @@ public final class Agent {
 		}
 
 		public void setMessages(List<AgentMessage> next) {
-			messages = new ArrayList<>(next);
+			messages = Collections.unmodifiableList(new ArrayList<>(next));
 		}
 	}
 
@@ -120,6 +119,10 @@ public final class Agent {
 	public Object thinkingBudgets = null;
 	public String transport = "auto";
 	public Long maxRetryDelayMs = null;
+	/** Maximum assistant turns per run; non-positive disables the guard. */
+	public Integer maxTurns = 100;
+	/** Maximum time allowed for one tool future; non-positive disables the timeout. */
+	public Long toolTimeoutMs = 0L;
 	public SimpleStreamOptions.OnPayload onPayload = null;
 	public SimpleStreamOptions.OnResponse onResponse = null;
 	public ToolExecutionMode toolExecution = ToolExecutionMode.PARALLEL;
@@ -129,6 +132,8 @@ public final class Agent {
 	private static final class ActiveRun {
 		final AbortSignal signal = new AbortSignal();
 		final CompletableFuture<Void> done = new CompletableFuture<>();
+		final int initialMessageCount;
+		ActiveRun(int initialMessageCount) { this.initialMessageCount = initialMessageCount; }
 	}
 
 	/** Options for constructing an {@link Agent}. Set fields after {@code new AgentOptions()}. */
@@ -159,6 +164,8 @@ public final class Agent {
 		public Object thinkingBudgets = null;
 		public String transport = "auto";
 		public Long maxRetryDelayMs = null;
+		public Integer maxTurns = 100;
+		public Long toolTimeoutMs = 0L;
 		public SimpleStreamOptions.OnPayload onPayload = null;
 		public SimpleStreamOptions.OnResponse onResponse = null;
 		public ToolExecutionMode toolExecution = ToolExecutionMode.PARALLEL;
@@ -192,6 +199,8 @@ public final class Agent {
 		thinkingBudgets = o.thinkingBudgets;
 		transport = o.transport;
 		maxRetryDelayMs = o.maxRetryDelayMs;
+		maxTurns = o.maxTurns;
+		toolTimeoutMs = o.toolTimeoutMs;
 		onPayload = o.onPayload;
 		onResponse = o.onResponse;
 		toolExecution = o.toolExecution;
@@ -257,22 +266,25 @@ public final class Agent {
 	// ───────────────────────── run control ─────────────────────────
 
 	public AbortSignal signal() {
-		return activeRun != null ? activeRun.signal : null;
+		ActiveRun run = activeRun;
+		return run != null ? run.signal : null;
 	}
 
 	public void abort() {
-		if (activeRun != null) activeRun.signal.abort();
+		ActiveRun run = activeRun;
+		if (run != null) run.signal.abort();
 	}
 
 	public CompletableFuture<Void> waitForIdle() {
-		return activeRun != null ? activeRun.done : CompletableFuture.completedFuture(null);
+		ActiveRun run = activeRun;
+		return run != null ? run.done : CompletableFuture.completedFuture(null);
 	}
 
-	public void reset() {
+	public synchronized void reset() {
 		if (activeRun != null) {
 			throw new IllegalStateException("Agent is already processing. Wait for completion before resetting.");
 		}
-		state.messages.clear();
+		state.setMessages(Collections.<AgentMessage>emptyList());
 		state.isStreaming = false;
 		state.streamingMessage = null;
 		state.pendingToolCalls = Collections.emptySet();
@@ -298,7 +310,7 @@ public final class Agent {
 		return prompt(Collections.singletonList(message));
 	}
 
-	public CompletableFuture<Void> prompt(List<AgentMessage> messages) {
+	public synchronized CompletableFuture<Void> prompt(List<AgentMessage> messages) {
 		if (activeRun != null) {
 			throw new IllegalStateException(
 					"Agent is already processing a prompt. Use steer()/followUp() to queue messages.");
@@ -307,7 +319,7 @@ public final class Agent {
 	}
 
 	/** Continue from the current transcript. Last message must be user/toolResult (or have queued steering/followUp). */
-	public CompletableFuture<Void> continueRun() {
+	public synchronized CompletableFuture<Void> continueRun() {
 		if (activeRun != null) {
 			throw new IllegalStateException("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -359,6 +371,8 @@ public final class Agent {
 		c.transport = transport;
 		c.thinkingBudgets = thinkingBudgets;
 		c.maxRetryDelayMs = maxRetryDelayMs;
+		c.maxTurns = maxTurns;
+		c.toolTimeoutMs = toolTimeoutMs;
 		c.onPayload = onPayload;
 		c.onResponse = onResponse;
 		c.toolExecution = toolExecution;
@@ -401,11 +415,11 @@ public final class Agent {
 		void run(AbortSignal signal) throws Exception;
 	}
 
-	private CompletableFuture<Void> runWithLifecycle(Task executor) {
+	private synchronized CompletableFuture<Void> runWithLifecycle(Task executor) {
 		if (activeRun != null) {
 			throw new IllegalStateException("Agent is already processing.");
 		}
-		ActiveRun run = new ActiveRun();
+		ActiveRun run = new ActiveRun(state.messages().size());
 		activeRun = run;
 		state.isStreaming = true;
 		state.streamingMessage = null;
@@ -427,23 +441,33 @@ public final class Agent {
 
 	private void handleRunFailure(Throwable error, boolean aborted) {
 		try {
+			String failureText = error.getMessage() != null ? error.getMessage() : error.toString();
 			AgentMessage.AssistantMessage failure = new AgentMessage.AssistantMessage(
-					Collections.<Content>singletonList(new Content.Text("")),
+					Collections.<Content>singletonList(new Content.Text(failureText)),
 					state.model.api(), state.model.provider(), state.model.id(),
 					Usage.empty(),
 					aborted ? StopReason.ABORTED : StopReason.ERROR,
-					error instanceof Exception ? error.getMessage() : error.toString(),
+					failureText,
 					System.currentTimeMillis());
 			processEvents(new AgentEvent.MessageStart(failure));
 			processEvents(new AgentEvent.MessageEnd(failure));
 			processEvents(new AgentEvent.TurnEnd(failure, Collections.<AgentMessage.ToolResultMessage>emptyList()));
-			processEvents(new AgentEvent.AgentEnd(Collections.<AgentMessage>singletonList(failure)));
+			List<AgentMessage> newMessages = new ArrayList<>();
+			List<AgentMessage> current = state.messages();
+			ActiveRun run = activeRun;
+			if (run != null && run.initialMessageCount < current.size()) {
+				newMessages.addAll(current.subList(run.initialMessageCount, current.size()));
+			}
+			if (newMessages.isEmpty() || !failure.equals(newMessages.get(newMessages.size() - 1))) {
+				newMessages.add(failure);
+			}
+			processEvents(new AgentEvent.AgentEnd(newMessages));
 		} catch (Throwable ignored) {
 			// Best-effort: ensure finishRun() still runs and the idle future resolves.
 		}
 	}
 
-	private void finishRun() {
+	private synchronized void finishRun() {
 		state.isStreaming = false;
 		state.streamingMessage = null;
 		state.pendingToolCalls = Collections.emptySet();
@@ -461,15 +485,17 @@ public final class Agent {
 			state.streamingMessage = ((AgentEvent.MessageUpdate) event).message();
 		} else if ("message_end".equals(type)) {
 			state.streamingMessage = null;
-			state.messages.add(((AgentEvent.MessageEnd) event).message());
+			List<AgentMessage> next = new ArrayList<>(state.messages);
+			next.add(((AgentEvent.MessageEnd) event).message());
+			state.setMessages(next);
 		} else if ("tool_execution_start".equals(type)) {
 			Set<String> next = new HashSet<String>(state.pendingToolCalls);
 			next.add(((AgentEvent.ToolExecutionStart) event).toolCallId());
-			state.pendingToolCalls = next;
+			state.pendingToolCalls = Collections.unmodifiableSet(next);
 		} else if ("tool_execution_end".equals(type)) {
 			Set<String> next = new HashSet<String>(state.pendingToolCalls);
 			next.remove(((AgentEvent.ToolExecutionEnd) event).toolCallId());
-			state.pendingToolCalls = next;
+			state.pendingToolCalls = Collections.unmodifiableSet(next);
 		} else if ("turn_end".equals(type)) {
 			AgentMessage message = ((AgentEvent.TurnEnd) event).message();
 			if (message instanceof AgentMessage.AssistantMessage) {
@@ -490,21 +516,21 @@ public final class Agent {
 
 	private static final class PendingMessageQueue {
 		private final List<AgentMessage> messages = new ArrayList<>();
-		QueueMode mode;
+		volatile QueueMode mode;
 
 		PendingMessageQueue(QueueMode mode) {
 			this.mode = mode;
 		}
 
-		void enqueue(AgentMessage m) {
+		synchronized void enqueue(AgentMessage m) {
 			messages.add(m);
 		}
 
-		boolean isEmpty() {
+		synchronized boolean isEmpty() {
 			return messages.isEmpty();
 		}
 
-		List<AgentMessage> drain() {
+		synchronized List<AgentMessage> drain() {
 			if (mode == QueueMode.ALL) {
 				List<AgentMessage> drained = new ArrayList<>(messages);
 				messages.clear();
@@ -515,7 +541,7 @@ public final class Agent {
 			return new ArrayList<AgentMessage>(Collections.singletonList(first));
 		}
 
-		void clear() {
+		synchronized void clear() {
 			messages.clear();
 		}
 	}

@@ -140,13 +140,30 @@ public final class Json {
 
 		Object parseNumber() {
 			int start = pos;
-			while (pos < src.length()) {
-				char c = src.charAt(pos);
-				if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') pos++;
-				else break;
+			if (peek() == '-') pos++;
+			if (pos >= src.length()) throw new IllegalArgumentException("Invalid number at " + start);
+			if (src.charAt(pos) == '0') {
+				pos++;
+				if (pos < src.length() && Character.isDigit(src.charAt(pos))) throw new IllegalArgumentException("Leading zero at " + start);
+			} else if (src.charAt(pos) >= '1' && src.charAt(pos) <= '9') {
+				while (pos < src.length() && Character.isDigit(src.charAt(pos))) pos++;
+			} else {
+				throw new IllegalArgumentException("Invalid number at " + start);
 			}
-			if (pos == start) throw new IllegalArgumentException("Invalid token at " + start);
-			return Double.parseDouble(src.substring(start, pos));
+			if (pos < src.length() && src.charAt(pos) == '.') {
+				pos++;
+				int fractionStart = pos;
+				while (pos < src.length() && Character.isDigit(src.charAt(pos))) pos++;
+				if (fractionStart == pos) throw new IllegalArgumentException("Invalid fraction at " + start);
+			}
+			if (pos < src.length() && (src.charAt(pos) == 'e' || src.charAt(pos) == 'E')) {
+				pos++;
+				if (pos < src.length() && (src.charAt(pos) == '+' || src.charAt(pos) == '-')) pos++;
+				int exponentStart = pos;
+				while (pos < src.length() && Character.isDigit(src.charAt(pos))) pos++;
+				if (exponentStart == pos) throw new IllegalArgumentException("Invalid exponent at " + start);
+			}
+			return Double.valueOf(src.substring(start, pos));
 		}
 
 		Boolean parseBool() {

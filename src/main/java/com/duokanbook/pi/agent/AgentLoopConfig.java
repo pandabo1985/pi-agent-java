@@ -34,6 +34,10 @@ public final class AgentLoopConfig {
 	public String transport = "auto";
 	public Object thinkingBudgets;
 	public Long maxRetryDelayMs;
+	/** Maximum assistant turns per run; non-positive disables the guard. */
+	public Integer maxTurns = 100;
+	/** Maximum time allowed for one tool future; non-positive disables the timeout. */
+	public Long toolTimeoutMs = 0L;
 	public SimpleStreamOptions.OnPayload onPayload;
 	public SimpleStreamOptions.OnResponse onResponse;
 

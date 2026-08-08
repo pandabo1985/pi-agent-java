@@ -22,7 +22,9 @@ import java.util.function.Supplier;
  * <em>bandwidth-optimized</em> events (no cumulative {@code partial} field — only deltas keyed
  * by {@code contentIndex}). This client reconstructs the cumulative assistant message locally.
  *
- * <p>Wire protocol (SSE over HTTP, one {@code data: <json>} frame per line):
+ * <p>Wire protocol (SSE over HTTP, {@code data: <json>} frames). The optional single space
+ * after {@code data:} is accepted, and multiple data lines are joined until the blank event
+ * delimiter:
  * <pre>
  *   start | text_{start,delta,end} | thinking_{start,delta,end} |
  *   toolcall_{start,delta,end} | done | error
@@ -75,6 +77,9 @@ public final class ProxyStreamFn implements StreamFn {
 		}
 
 		try {
+			if (options != null && options.signal() != null && options.signal().isAborted()) {
+				throw new AbortSignal.AbortedException("Request aborted by user");
+			}
 			String body = buildRequestBody(model, context, options);
 			HttpURLConnection request = (HttpURLConnection) new URL(proxyUrl + "/api/stream").openConnection();
 			connection[0] = request;
@@ -97,22 +102,32 @@ public final class ProxyStreamFn implements StreamFn {
 
 			BufferedReader reader = new BufferedReader(new InputStreamReader(holder[0], StandardCharsets.UTF_8));
 			String line;
+			StringBuilder sseData = new StringBuilder();
+			boolean terminalEvent = false;
 			while ((line = reader.readLine()) != null) {
 				if (options != null && options.signal() != null && options.signal().isAborted()) {
 					throw new IOException("Request aborted by user");
 				}
-				if (!line.startsWith("data: ")) continue;
-				String data = line.substring(6).trim();
-				if (data.isEmpty()) continue;
-				Object parsed = Json.parse(data);
-				if (!(parsed instanceof Map<?, ?>)) continue;
-				@SuppressWarnings("unchecked")
-				Map<String, Object> event = (Map<String, Object>) parsed;
-				AssistantMessageEvent ev = rc.process(event);
-				if (ev != null) stream.push(ev);
+				if (line.isEmpty()) {
+					if (sseData.length() > 0) {
+						terminalEvent = dispatchSseData(sseData.toString(), rc, stream) || terminalEvent;
+						sseData.setLength(0);
+						if (terminalEvent) {
+							stream.end(rc.partial);
+							return;
+						}
+					}
+					continue;
+				}
+				if (line.startsWith("data:")) {
+					String data = line.substring(5);
+					if (data.startsWith(" ")) data = data.substring(1);
+					sseData.append(data).append('\n');
+				}
 			}
-			// Stream ended without a terminal event — finalize from the current partial.
-			stream.end(rc.partial);
+			if (sseData.length() > 0) terminalEvent = dispatchSseData(sseData.toString(), rc, stream) || terminalEvent;
+			if (terminalEvent) stream.end(rc.partial);
+			else terminateWithError(stream, rc, options, "Proxy stream ended without a terminal event");
 		} catch (Throwable e) {
 			boolean aborted = options != null && options.signal() != null && options.signal().isAborted();
 			String message = aborted ? "Request aborted by user" : messageOf(e);
@@ -127,6 +142,19 @@ public final class ProxyStreamFn implements StreamFn {
 			}
 			if (connection[0] != null) connection[0].disconnect();
 		}
+	}
+
+	private static boolean dispatchSseData(String raw, Reconstructor rc,
+			EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> stream) {
+		String data = raw.endsWith("\n") ? raw.substring(0, raw.length() - 1) : raw;
+		if (data.trim().isEmpty()) return false;
+		Object parsed = Json.parse(data);
+		if (!(parsed instanceof Map<?, ?>)) return false;
+		@SuppressWarnings("unchecked")
+		Map<String, Object> event = (Map<String, Object>) parsed;
+		AssistantMessageEvent ev = rc.process(event);
+		if (ev != null) stream.push(ev);
+		return ev != null && ("done".equals(ev.type()) || "error".equals(ev.type()));
 	}
 
 	private void terminateWithError(EventStream<AssistantMessageEvent, AgentMessage.AssistantMessage> stream,

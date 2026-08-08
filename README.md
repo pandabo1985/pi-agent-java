@@ -122,6 +122,12 @@ terminal `AssistantMessageEvent.ErrorEvent` whose message has `stopReason = ABOR
 - **Event processing is synchronized** in `Agent.processEvents`, so the concurrent
   `tool_execution_end` emissions of a parallel tool batch serialize (mirroring JS's
   single-threaded event ordering).
+- **Transcript reads are snapshots.** `Agent.state().messages()` and `.tools()` are immutable,
+  copy-on-write snapshots, so a streaming UI can iterate them while the run thread publishes
+  subsequent events.
+- **Bounded execution is configurable.** `Agent.maxTurns` defaults to 100 assistant responses
+  per run (`<= 0` disables the guard). `Agent.toolTimeoutMs` defaults to disabled; a positive
+  value cancels an overdue tool future and records an error tool result.
 - **`AgentMessage` collapses the TS `Message | AgentMessage` split** into one hierarchy
   (`User/Assistant/ToolResult/Custom`). `convertToLlm` filters out `Custom`. Add a class
   implementing `AgentMessage` to introduce a fully typed custom message.

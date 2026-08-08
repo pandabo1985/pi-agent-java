@@ -1,7 +1,7 @@
 package com.duokanbook.pi.agent;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Cooperative cancellation signal, the Java analogue of the web {@code AbortSignal}
@@ -20,19 +20,23 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public final class AbortSignal {
 
-	private volatile boolean aborted = false;
-	private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
+	private boolean aborted = false;
+	private final List<Runnable> listeners = new ArrayList<>();
 
 	/** Returns {@code true} once {@link #abort()} has been called. */
-	public boolean isAborted() {
+	public synchronized boolean isAborted() {
 		return aborted;
 	}
 
 	/** Abort the run. Notifies all registered listeners once. Idempotent. */
 	public void abort() {
-		if (aborted) return;
-		aborted = true;
-		for (Runnable l : listeners) {
+		List<Runnable> pending;
+		synchronized (this) {
+			if (aborted) return;
+			aborted = true;
+			pending = new ArrayList<>(listeners);
+		}
+		for (Runnable l : pending) {
 			try {
 				l.run();
 			} catch (RuntimeException ignored) {
@@ -46,15 +50,16 @@ public final class AbortSignal {
 	 * the listener runs immediately. Returns itself for chaining/unregister use.
 	 */
 	public Runnable addListener(Runnable listener) {
-		if (aborted) {
-			listener.run();
-		} else {
-			listeners.add(listener);
+		boolean runImmediately;
+		synchronized (this) {
+			runImmediately = aborted;
+			if (!runImmediately) listeners.add(listener);
 		}
+		if (runImmediately) listener.run();
 		return listener;
 	}
 
-	public void removeListener(Runnable listener) {
+	public synchronized void removeListener(Runnable listener) {
 		listeners.remove(listener);
 	}
 
