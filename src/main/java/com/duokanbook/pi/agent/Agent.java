@@ -34,6 +34,7 @@ public final class Agent {
 
 	// ── Agent-level hook signatures (carry the active signal, like the TS wrapper) ──
 	@FunctionalInterface
+	@Deprecated
 	public interface ShouldStopAfterTurnHook {
 		CompletableFuture<Boolean> apply(AgentLoopConfig.TurnContext ctx, AbortSignal signal);
 	}
@@ -106,7 +107,11 @@ public final class Agent {
 	public AgentLoopConfig.GetApiKey getApiKey = null;
 	public AgentLoopConfig.BeforeToolCall beforeToolCall = null;
 	public AgentLoopConfig.AfterToolCall afterToolCall = null;
+	/** @deprecated Prefer {@link #finishTurn}. */
+	@Deprecated
 	public ShouldStopAfterTurnHook shouldStopAfterTurn = null;
+	public AgentLoopConfig.FinishTurn finishTurn = null;
+	public AgentLoopConfig.PrepareRequest prepareRequest = null;
 	public PrepareNextTurnHook prepareNextTurn = null;
 	public PrepareNextTurnWithContextHook prepareNextTurnWithContext = null;
 	public String sessionId = null;
@@ -149,7 +154,11 @@ public final class Agent {
 		public AgentLoopConfig.GetApiKey getApiKey = null;
 		public AgentLoopConfig.BeforeToolCall beforeToolCall = null;
 		public AgentLoopConfig.AfterToolCall afterToolCall = null;
+		/** @deprecated Prefer {@link AgentLoopConfig.FinishTurn}. */
+		@Deprecated
 		public ShouldStopAfterTurnHook shouldStopAfterTurn = null;
+		public AgentLoopConfig.FinishTurn finishTurn = null;
+		public AgentLoopConfig.PrepareRequest prepareRequest = null;
 		public PrepareNextTurnHook prepareNextTurn = null;
 		public PrepareNextTurnWithContextHook prepareNextTurnWithContext = null;
 		public QueueMode steeringMode = QueueMode.ONE_AT_A_TIME;
@@ -185,6 +194,8 @@ public final class Agent {
 		beforeToolCall = o.beforeToolCall;
 		afterToolCall = o.afterToolCall;
 		shouldStopAfterTurn = o.shouldStopAfterTurn;
+		finishTurn = o.finishTurn;
+		prepareRequest = o.prepareRequest;
 		prepareNextTurn = o.prepareNextTurn;
 		prepareNextTurnWithContext = o.prepareNextTurnWithContext;
 		steeringQueue.mode = o.steeringMode;
@@ -261,6 +272,12 @@ public final class Agent {
 
 	public boolean hasQueuedMessages() {
 		return !steeringQueue.isEmpty() || !followUpQueue.isEmpty();
+	}
+
+	/** Preview the next queue-selected batch without consuming it. Steering has priority. */
+	public List<AgentMessage> peekQueuedMessages() {
+		List<AgentMessage> steering = steeringQueue.peek();
+		return !steering.isEmpty() ? steering : followUpQueue.peek();
 	}
 
 	// ───────────────────────── run control ─────────────────────────
@@ -381,6 +398,8 @@ public final class Agent {
 		c.getApiKey = getApiKey;
 		c.beforeToolCall = beforeToolCall;
 		c.afterToolCall = afterToolCall;
+		c.finishTurn = finishTurn;
+		c.prepareRequest = prepareRequest;
 
 		final ShouldStopAfterTurnHook sst = shouldStopAfterTurn;
 		c.shouldStopAfterTurn = sst != null ? ctx -> sst.apply(ctx, signal) : null;
@@ -530,15 +549,20 @@ public final class Agent {
 			return messages.isEmpty();
 		}
 
-		synchronized List<AgentMessage> drain() {
+		synchronized List<AgentMessage> peek() {
 			if (mode == QueueMode.ALL) {
-				List<AgentMessage> drained = new ArrayList<>(messages);
-				messages.clear();
-				return drained;
+				return new ArrayList<>(messages);
 			}
 			if (messages.isEmpty()) return Collections.emptyList();
-			AgentMessage first = messages.remove(0);
-			return new ArrayList<AgentMessage>(Collections.singletonList(first));
+			return new ArrayList<AgentMessage>(Collections.singletonList(messages.get(0)));
+		}
+
+		synchronized List<AgentMessage> drain() {
+			List<AgentMessage> drained = peek();
+			if (!drained.isEmpty()) {
+				messages.subList(0, drained.size()).clear();
+			}
+			return drained;
 		}
 
 		synchronized void clear() {

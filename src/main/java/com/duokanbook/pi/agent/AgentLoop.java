@@ -129,7 +129,8 @@ public final class AgentLoop {
 			StreamFn streamFunction) throws Exception {
 
 		AgentContext currentContext = initialContext;
-		boolean firstTurn = true;
+		AgentLoopConfig.TurnContext lastCompletedTurn = null;
+		boolean explicitContinuation = false;
 		int assistantTurns = 0;
 		// Steering messages may have arrived while the caller was waiting to start.
 		List<AgentMessage> pendingMessages = drainSteering(config);
@@ -138,25 +139,42 @@ public final class AgentLoop {
 		while (true) {
 			boolean hasMoreToolCalls = true;
 
-			// Inner loop: consume tool calls and steering messages.
+			// Inner loop: consume tool-result continuations and steering messages.
 			while (hasMoreToolCalls || !pendingMessages.isEmpty()) {
 				if (signal != null) signal.check();
-				if (!firstTurn) {
+
+				List<AgentMessage> preparedMessages = new ArrayList<>();
+				if (lastCompletedTurn != null) {
+					AgentLoopConfig.TurnUpdate upd = config.prepareNextTurn == null ? null
+							: config.prepareNextTurn.apply(lastCompletedTurn).join();
+					if (upd != null) {
+						if (upd.context() != null) currentContext = upd.context();
+						if (upd.messages() != null) preparedMessages.addAll(upd.messages());
+						if (upd.model() != null) config.model = upd.model();
+						if (upd.thinkingLevel() != null) {
+							config.reasoning = upd.thinkingLevel() == ThinkingLevel.OFF ? null : upd.thinkingLevel();
+						}
+					}
+
+					// Preparation can be slow (for example, compaction). Pick up steering that
+					// arrived while it ran, but do not double-drain one-at-a-time queues.
+					if (pendingMessages.isEmpty()) {
+						pendingMessages = drainSteering(config);
+					}
 					emit.emit(new AgentEvent.TurnStart());
-				} else {
-					firstTurn = false;
 				}
 
-				// Inject pending steering messages before the next assistant response.
-				if (!pendingMessages.isEmpty()) {
-					for (AgentMessage message : pendingMessages) {
-						emit.emit(new AgentEvent.MessageStart(message));
-						emit.emit(new AgentEvent.MessageEnd(message));
-						currentContext.messages.add(message);
-						newMessages.add(message);
-					}
-					pendingMessages = new ArrayList<>();
+				// Prepared messages and queued user input are normal transcript messages and
+				// therefore receive the same message lifecycle events.
+				List<AgentMessage> selectedMessages = new ArrayList<>(preparedMessages);
+				selectedMessages.addAll(pendingMessages);
+				for (AgentMessage message : selectedMessages) {
+					emit.emit(new AgentEvent.MessageStart(message));
+					emit.emit(new AgentEvent.MessageEnd(message));
+					currentContext.messages.add(message);
+					newMessages.add(message);
 				}
+				pendingMessages = new ArrayList<>();
 
 				if (config.maxTurns != null && config.maxTurns > 0 && assistantTurns >= config.maxTurns) {
 					AgentMessage.AssistantMessage failure = new AgentMessage.AssistantMessage(
@@ -167,9 +185,27 @@ public final class AgentLoop {
 					newMessages.add(failure);
 					emit.emit(new AgentEvent.MessageStart(failure));
 					emit.emit(new AgentEvent.MessageEnd(failure));
+					AgentLoopConfig.TurnContext limitTurn = new AgentLoopConfig.TurnContext(
+							failure, Collections.<AgentMessage.ToolResultMessage>emptyList(), currentContext, newMessages);
+					if (config.finishTurn != null) config.finishTurn.apply(limitTurn, signal).join();
 					emit.emit(new AgentEvent.TurnEnd(failure, Collections.<AgentMessage.ToolResultMessage>emptyList()));
 					emit.emit(new AgentEvent.AgentEnd(newMessages));
 					return;
+				}
+
+				// Final request-preparation seam. Pending messages are already visible here.
+				if (config.prepareRequest != null) {
+					ThinkingLevel thinking = config.reasoning != null ? config.reasoning : ThinkingLevel.OFF;
+					AgentLoopConfig.RequestUpdate requestUpdate = config.prepareRequest.apply(
+							new AgentLoopConfig.PrepareRequestContext(currentContext, config.model, thinking), signal).join();
+					if (requestUpdate != null) {
+						if (requestUpdate.context() != null) currentContext = requestUpdate.context();
+						if (requestUpdate.model() != null) config.model = requestUpdate.model();
+						if (requestUpdate.thinkingLevel() != null) {
+							config.reasoning = requestUpdate.thinkingLevel() == ThinkingLevel.OFF
+									? null : requestUpdate.thinkingLevel();
+						}
+					}
 				}
 
 				// Stream one assistant response.
@@ -179,6 +215,9 @@ public final class AgentLoop {
 				newMessages.add(message);
 
 				if (message.stopReason() == StopReason.ERROR || message.stopReason() == StopReason.ABORTED) {
+					lastCompletedTurn = new AgentLoopConfig.TurnContext(
+							message, Collections.<AgentMessage.ToolResultMessage>emptyList(), currentContext, newMessages);
+					if (config.finishTurn != null) config.finishTurn.apply(lastCompletedTurn, signal).join();
 					emit.emit(new AgentEvent.TurnEnd(message, Collections.<AgentMessage.ToolResultMessage>emptyList()));
 					emit.emit(new AgentEvent.AgentEnd(newMessages));
 					return;
@@ -201,34 +240,47 @@ public final class AgentLoop {
 					}
 				}
 
-				emit.emit(new AgentEvent.TurnEnd(message, toolResults));
-
-				// Let the caller swap context/model/thinking for the next turn.
-				AgentLoopConfig.TurnContext turnCtx = new AgentLoopConfig.TurnContext(
+				lastCompletedTurn = new AgentLoopConfig.TurnContext(
 						message, toolResults, currentContext, newMessages);
-				AgentLoopConfig.TurnUpdate upd = (config.prepareNextTurn == null) ? null
-						: config.prepareNextTurn.apply(turnCtx).join();
-				if (upd != null) {
-					if (upd.context() != null) currentContext = upd.context();
-					if (upd.model() != null) config.model = upd.model();
-					if (upd.thinkingLevel() != null) {
-						config.reasoning = upd.thinkingLevel() == ThinkingLevel.OFF ? null : upd.thinkingLevel();
-					}
+
+				AgentLoopConfig.TurnDecision decision = config.finishTurn == null ? null
+						: config.finishTurn.apply(lastCompletedTurn, signal).join();
+
+				// Backward compatibility for the pre-finishTurn Java API. It intentionally runs
+				// only on normal responses, matching the historical shouldStopAfterTurn behavior.
+				if (decision == null && config.finishTurn == null && config.shouldStopAfterTurn != null
+						&& config.shouldStopAfterTurn.apply(lastCompletedTurn).join()) {
+					decision = AgentLoopConfig.TurnDecision.endRun();
 				}
 
-				if (config.shouldStopAfterTurn != null
-						&& config.shouldStopAfterTurn.apply(turnCtx).join()) {
+				emit.emit(new AgentEvent.TurnEnd(message, toolResults));
+
+				if (decision != null && decision.action() == AgentLoopConfig.TurnAction.END) {
 					emit.emit(new AgentEvent.AgentEnd(newMessages));
 					return;
 				}
 
+				explicitContinuation = decision != null
+						&& decision.action() == AgentLoopConfig.TurnAction.CONTINUE;
+
 				pendingMessages = drainSteering(config);
+				if (hasMoreToolCalls || !pendingMessages.isEmpty()) {
+					explicitContinuation = false;
+				}
 			}
 
 			// Agent would stop here — check for follow-up messages.
 			List<AgentMessage> followUps = drainFollowUp(config);
 			if (!followUps.isEmpty()) {
+				explicitContinuation = false;
 				pendingMessages = followUps;
+				continue outer;
+			}
+
+			// No natural continuation was selected; fulfill an explicit CONTINUE with
+			// exactly one context-only provider turn.
+			if (explicitContinuation) {
+				explicitContinuation = false;
 				continue outer;
 			}
 			break;
@@ -475,8 +527,14 @@ public final class AgentLoop {
 
 			Prepared prepared = (Prepared) preparation;
 			entries.add(() -> {
-				ExecutedToolCallOutcome executed = executePrepared(prepared, config, signal, emit);
-				FinalizedToolCall finalized = finalizeExecuted(currentContext, assistantMessage, prepared, executed, config, signal);
+				FinalizedToolCall finalized;
+				if (signal != null && signal.isAborted()) {
+					finalized = new FinalizedToolCall(prepared.toolCall(),
+							AgentToolResult.error("Operation aborted"), true);
+				} else {
+					ExecutedToolCallOutcome executed = executePrepared(prepared, config, signal, emit);
+					finalized = finalizeExecuted(currentContext, assistantMessage, prepared, executed, config, signal);
+				}
 				try {
 					emit.emit(new AgentEvent.ToolExecutionEnd(prepared.toolCall().id(), prepared.toolCall().name(),
 							finalized.result, finalized.isError));
@@ -557,8 +615,6 @@ public final class AgentLoop {
 				return new Immediate(AgentToolResult.error("Operation aborted"), true);
 			}
 			return new Prepared(toolCall, tool, validatedArgs);
-		} catch (AbortSignal.AbortedException e) {
-			throw e;
 		} catch (Throwable e) {
 			return new Immediate(AgentToolResult.error(messageOf(e)), true);
 		}
@@ -582,8 +638,6 @@ public final class AgentLoop {
 			});
 			AgentToolResult<?> result = awaitToolResult(future, config.toolTimeoutMs, signal, prepared.toolCall().name());
 			return new ExecutedToolCallOutcome(result, false);
-		} catch (AbortSignal.AbortedException e) {
-			throw e;
 		} catch (Throwable e) {
 			return new ExecutedToolCallOutcome(AgentToolResult.error(messageOf(e)), true);
 		} finally {

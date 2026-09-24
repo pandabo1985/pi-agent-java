@@ -3,6 +3,11 @@
 > 目标：把 `@earendil-works/pi-agent-core`（`packages/agent`）的核心功能拆解为可独立复现的原理。读完本文，可以在任意语言/运行时里重新实现一个等价的"通用 LLM Agent 运行时"。
 >
 > 阅读顺序建议：先看 §1–§3 建立全局观，再精读 §4（核心循环）和 §6（工具系统），这两节是整个库的灵魂。
+>
+> **版本说明（2026-09-24）**：Agent classic runtime 的生命周期与调度语义已按上游
+> `pi-agent-core 0.87.x` / 当日 `packages/agent` 主分支复核。Java 实现仍保留旧式
+> `LlmContext.systemPrompt/tools` Provider 边界；上游已经迁移到 system message 驱动的
+> `TranscriptContext`，这是当前剩余的主要结构性 parity gap。
 
 ---
 
@@ -114,82 +119,88 @@ type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 ### 4.2 runLoop 算法（双层 while）
 
-```text
-function runLoop(initialContext, newMessages, config, signal, emit, streamFn):
-    currentContext = initialContext
-    firstTurn = true
-    pendingMessages = await config.getSteeringMessages?()     // 启动时先捞一次（用户等待时可能已输入）
+当前经典运行时的关键不是简单的“有工具就继续”，而是**自然 continuation + steering +
+follow-up + 显式 continue** 四种调度来源共同决定下一次 provider request。
 
-    while true:                                                # ── 外层：followUp 驱动
+```text
+runLoop:
+    lastCompletedTurn = none
+    explicitContinuation = false
+    pending = pollSteering()                         # 启动前已排队的输入
+
+    while true:                                      # 外层：follow-up / 显式 continue
         hasMoreToolCalls = true
 
-        while hasMoreToolCalls OR pendingMessages非空:         # ── 内层：工具 + steering 驱动
-            if not firstTurn: emit(turn_start)
-            else: firstTurn = false
+        while hasMoreToolCalls OR pending非空:       # 内层：tool-result / steering
+            if lastCompletedTurn exists:
+                update = prepareNextTurn(lastCompletedTurn)
+                apply context/model/thinking
+                preparedMessages = update.messages
 
-            # 1) 注入 pending steering 消息（首批 prompt 由外层 runAgentLoop 在 runLoop 之前已注入 context，不走此队列）
-            for msg in pendingMessages:
-                emit(message_start, msg); emit(message_end, msg)
-                currentContext.messages.push(msg)
-                newMessages.push(msg)
-            pendingMessages = []
+                if pending为空:
+                    pending = pollSteering()          # 捕获 prepareNextTurn 期间新来的 steer
 
-            # 2) 流式拿一个 assistant 回合
-            message = streamAssistantResponse(currentContext, config, signal, emit, streamFn)
+                emit(turn_start)
+
+            append+emit(preparedMessages + pending)
+            pending = []
+
+            requestUpdate = prepareRequest(...)       # 包括第一次 provider request
+            apply context/model/thinking
+
+            message = streamAssistantResponse(...)
             newMessages.push(message)
 
-            # 3) 错误/中止 → 直接收尾
-            if message.stopReason in ("error","aborted"):
-                emit(turn_end, message, toolResults=[])
-                emit(agent_end, newMessages)
+            if message is error/aborted:
+                finishTurn(...)                       # 决策被忽略，错误/中止是硬退出
+                emit(turn_end)
+                emit(agent_end)
                 return
 
-            # 4) 执行工具
-            toolCalls = message.content.filter(type=="toolCall")
-            toolResults = []
-            hasMoreToolCalls = false
-            if toolCalls非空:
-                if message.stopReason == "length":            # 输出被截断 → 参数可能残缺，全部判错
-                    batch = failToolCallsFromTruncatedMessage(toolCalls, emit)
-                else:
-                    batch = executeToolCalls(currentContext, message, config, signal, emit)
-                toolResults = batch.messages
-                hasMoreToolCalls = not batch.terminate        # 整批都 terminate 才停
-                for r in toolResults:
-                    currentContext.messages.push(r); newMessages.push(r)
+            toolResults = execute tools
+            append toolResults
 
-            emit(turn_end, message, toolResults)
+            lastCompletedTurn = {message, toolResults, context, newMessages}
+            decision = finishTurn(lastCompletedTurn) # 在 turn_end 之前
+            emit(turn_end)
 
-            # 5) 下一回合配置覆盖（可换 model / context / thinking）
-            upd = await config.prepareNextTurn?({message, toolResults, context, newMessages})
-            if upd: currentContext = upd.context ?? currentContext
-                     config.model = upd.model ?? config.model
-                     config.reasoning = upd.thinkingLevel ...
+            if decision == END:
+                emit(agent_end)
+                return
 
-            # 6) 优雅停止判定
-            if await config.shouldStopAfterTurn?({...}):
-                emit(agent_end, newMessages); return
+            explicitContinuation = (decision == CONTINUE)
+            pending = pollSteering()
 
-            # 7) 再捞一次 steering（用户可能在回合进行中插话）
-            pendingMessages = await config.getSteeringMessages?()
+            if toolResults 自然要求续跑 OR pending非空:
+                explicitContinuation = false          # 已有下一请求，不额外再加一次
 
-        # 内层结束 = agent 本来要停了
-        followUps = await config.getFollowUpMessages?()
+        followUps = pollFollowUp()
         if followUps非空:
-            pendingMessages = followUps
-            continue                                            # 回到外层 while，继续跑
-        break                                                   # 真的没事干了
+            explicitContinuation = false
+            pending = followUps
+            continue
 
-    emit(agent_end, newMessages)
+        if explicitContinuation:
+            explicitContinuation = false
+            continue                                  # 一次 context-only request
+
+        break
+
+    emit(agent_end)
 ```
 
-**循环终止条件**（任一即停）：
-- assistant `stopReason` 为 `error` / `aborted`；
-- 整批工具结果都置 `terminate: true`（`hasMoreToolCalls = false` 且无 pending）；
-- `shouldStopAfterTurn` 返回 `true`；
-- 内层结束后 `getFollowUpMessages` 为空。
+关键边界：
 
-> **step 5 细节**：`prepareNextTurn` 只能覆盖 `context` / `model` / `reasoning`（thinking）三项，其中 `thinkingLevel: "off"` 会被映射成 `reasoning: undefined`（即不开启推理）；`convertToLlm`、`transformContext`、`toolExecution`、各 hook 均**不能**按回合切换。
+- `prepareRequest` 在**每一次** provider request 前运行，包括第一次；此时本轮已经选中的输入
+  已写入 transcript，但它本身不会再次 poll queue。
+- `finishTurn` 在 assistant/toolResult 全部 final 后、`turn_end` 前运行。
+  `END` 会在 queue polling 之前结束；`CONTINUE` 只保证“一次下一请求”，如果 tool result、
+  steering 或 follow-up 已经天然触发下一请求，不会再额外请求一次。
+- `prepareNextTurn` 只在“确定还会继续”时运行，位于下一次 `turn_start` 之前；除了替换
+  context/model/thinking，还可以返回 `messages`，这些消息会按正常 message lifecycle 写入。
+- `shouldStopAfterTurn` 是 Java 端为旧调用方保留的 deprecated 兼容钩子；新代码使用
+  `finishTurn`。
+- error/aborted assistant 是硬退出，但 `finishTurn` 仍会被调用一次，便于持久化/审计边界统一。
 
 ### 4.3 streamAssistantResponse（模型调用边界）
 
@@ -584,47 +595,84 @@ interface ExecutionEnv extends FileSystem, Shell {}
 ### 最小骨架（伪代码）
 
 ```ts
-// 注意：runLoop 自身不发 agent_start，也不发 turn 0 的 turn_start，也不注入首批 prompt
-// （这些都由外层包装 runAgentLoop 在调用前发出 / 注入；prompt 用例下 newMsgs 需以 prompts 预填）。
-// 下方保留与源码一致的 firstTurn 守卫。
 async function runLoop(ctx, newMsgs, config, emit, signal, streamFn) {
+  let lastTurn;
+  let explicitContinue = false;
   let pending = (await config.getSteeringMessages?.()) ?? [];
-  let firstTurn = true;
+
   outer: while (true) {
     let more = true;
+
     while (more || pending.length) {
-      if (!firstTurn) emit({ type: "turn_start" });
-      else firstTurn = false;
-      for (const m of pending) { emit({type:"message_start",message:m}); emit({type:"message_end",message:m}); ctx.messages.push(m); newMsgs.push(m); }
-      pending = [];
-      const msg = await streamAssistantResponse(ctx, config, signal, emit, streamFn); // 会 push 进 ctx.messages
-      newMsgs.push(msg);
-      if (msg.stopReason === "error" || msg.stopReason === "aborted") {
-        emit({type:"turn_end", message:msg, toolResults:[]});
-        emit({type:"agent_end", messages:newMsgs}); return newMsgs;
+      let prepared = [];
+
+      if (lastTurn) {
+        const upd = await config.prepareNextTurn?.(lastTurn);
+        if (upd?.context) ctx = upd.context;
+        if (upd?.model) config.model = upd.model;
+        if (upd?.thinkingLevel !== undefined) config.reasoning = upd.thinkingLevel;
+        prepared = upd?.messages ?? [];
+
+        if (!pending.length) pending = (await config.getSteeringMessages?.()) ?? [];
+        await emit({type:"turn_start"});
       }
+
+      for (const m of [...prepared, ...pending]) {
+        await emit({type:"message_start", message:m});
+        await emit({type:"message_end", message:m});
+        ctx.messages.push(m); newMsgs.push(m);
+      }
+      pending = [];
+
+      const req = await config.prepareRequest?.({
+        context: ctx, model: config.model, thinkingLevel: config.reasoning ?? "off"
+      }, signal);
+      if (req?.context) ctx = req.context;
+      if (req?.model) config.model = req.model;
+
+      const msg = await streamAssistantResponse(ctx, config, signal, emit, streamFn);
+      newMsgs.push(msg);
+
+      if (msg.stopReason === "error" || msg.stopReason === "aborted") {
+        lastTurn = {message:msg, toolResults:[], context:ctx, newMessages:newMsgs};
+        await config.finishTurn?.(lastTurn, signal);
+        await emit({type:"turn_end", message:msg, toolResults:[]});
+        await emit({type:"agent_end", messages:newMsgs});
+        return newMsgs;
+      }
+
       const calls = msg.content.filter(c => c.type === "toolCall");
       let toolResults = []; more = false;
       if (calls.length) {
         const batch = msg.stopReason === "length"
           ? await failTruncated(calls, emit)
           : await executeToolCalls(ctx, msg, calls, config, signal, emit);
-        toolResults = batch.messages; more = !batch.terminate;
+        toolResults = batch.messages;
+        more = !batch.terminate;
         for (const r of toolResults) { ctx.messages.push(r); newMsgs.push(r); }
       }
-      emit({type:"turn_end", message:msg, toolResults});
-      const upd = await config.prepareNextTurn?.({message:msg, toolResults, context:ctx, newMessages:newMsgs});
-      if (upd) { if (upd.context) ctx = upd.context; if (upd.model) config.model = upd.model; }
-      if (await config.shouldStopAfterTurn?.({message:msg, toolResults,context:ctx,newMessages:newMsgs})) {
-        emit({type:"agent_end", messages:newMsgs}); return newMsgs;
+
+      lastTurn = {message:msg, toolResults, context:ctx, newMessages:newMsgs};
+      const decision = await config.finishTurn?.(lastTurn, signal);
+      await emit({type:"turn_end", message:msg, toolResults});
+
+      if (decision?.action === "end") {
+        await emit({type:"agent_end", messages:newMsgs});
+        return newMsgs;
       }
+
+      explicitContinue = decision?.action === "continue";
       pending = (await config.getSteeringMessages?.()) ?? [];
+      if (more || pending.length) explicitContinue = false;
     }
-    const fu = (await config.getFollowUpMessages?.()) ?? [];
-    if (fu.length) { pending = fu; continue outer; }
+
+    const follow = (await config.getFollowUpMessages?.()) ?? [];
+    if (follow.length) { explicitContinue = false; pending = follow; continue outer; }
+    if (explicitContinue) { explicitContinue = false; continue outer; }
     break;
   }
-  emit({type:"agent_end", messages:newMsgs});
+
+  await emit({type:"agent_end", messages:newMsgs});
   return newMsgs;
 }
 ```
@@ -706,4 +754,4 @@ async function executeToolCalls(ctx, asstMsg, calls, config, signal, emit) {
 
 ---
 
-*本文基于 `@earendil-works/pi-agent-core` v0.84.1 的源码分析。所有算法描述与代码片段均可与 `src/` 下的实现一一对照。*
+*本文最初基于早期版本整理，并于 2026-09-24 按 `pi-agent-core 0.87.x` classic runtime 重新复核生命周期、队列、Tool 与 abort 语义。涉及 Provider 上下文的章节需注意：Java 版尚未完成上游 messages-only `TranscriptContext` / system-message tool declaration 迁移。*

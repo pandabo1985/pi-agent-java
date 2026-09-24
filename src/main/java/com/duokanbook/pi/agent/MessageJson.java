@@ -36,6 +36,21 @@ public final class MessageJson {
 		return o;
 	}
 
+	/**
+	 * Serialize the provider-visible declaration of an executable tool.
+	 *
+	 * <p>This is required by the Java port's current legacy proxy context shape. The latest
+	 * TypeScript runtime carries tool declarations in transcript system messages instead; see
+	 * the compatibility notes in README.md.
+	 */
+	public static Map<String, Object> toJson(AgentTool tool) {
+		Map<String, Object> o = new LinkedHashMap<>();
+		o.put("name", tool.name());
+		o.put("description", tool.description());
+		o.put("parameters", tool.parameters() != null ? tool.parameters() : new LinkedHashMap<String, Object>());
+		return o;
+	}
+
 	public static Map<String, Object> toJson(Usage u) {
 		Map<String, Object> o = new LinkedHashMap<>();
 		o.put("input", u.input());
