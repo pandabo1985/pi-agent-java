@@ -48,7 +48,14 @@ public final class AgentLoopConfig {
 	// ── optional hooks ──
 	public TransformContext transformContext;
 	public GetApiKey getApiKey;
+	/**
+	 * Legacy stop hook retained for source compatibility. New code should prefer {@link #finishTurn},
+	 * which can request either END or CONTINUE and also runs for error/aborted turns.
+	 */
+	@Deprecated
 	public ShouldStopAfterTurn shouldStopAfterTurn;
+	public FinishTurn finishTurn;
+	public PrepareRequest prepareRequest;
 	public PrepareNextTurn prepareNextTurn;
 	public GetMessages getSteeringMessages;
 	public GetMessages getFollowUpMessages;
@@ -104,7 +111,7 @@ public final class AgentLoopConfig {
 		@Override protected Object[] componentValues() { return new Object[] {assistantMessage, toolCall, args, result, isError, context}; }
 	}
 
-	/** Context passed to {@link ShouldStopAfterTurn} and {@link PrepareNextTurn}. */
+	/** Context passed to turn-finalization and next-turn hooks. */
 	public static final class TurnContext extends ValueObject {
 		private final AgentMessage.AssistantMessage message;
 		private final List<AgentMessage.ToolResultMessage> toolResults;
@@ -125,9 +132,31 @@ public final class AgentLoopConfig {
 	/** Replacement runtime state returned from {@link PrepareNextTurn}. */
 	public static final class TurnUpdate extends ValueObject {
 		private final AgentContext context;
+		private final List<AgentMessage> messages;
 		private final Model model;
 		private final ThinkingLevel thinkingLevel;
+
 		public TurnUpdate(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
+			this(context, null, model, thinkingLevel);
+		}
+
+		public TurnUpdate(AgentContext context, List<AgentMessage> messages, Model model, ThinkingLevel thinkingLevel) {
+			this.context = context; this.messages = messages; this.model = model; this.thinkingLevel = thinkingLevel;
+		}
+		public AgentContext context() { return context; }
+		public List<AgentMessage> messages() { return messages; }
+		public Model model() { return model; }
+		public ThinkingLevel thinkingLevel() { return thinkingLevel; }
+		@Override protected String[] componentNames() { return new String[] {"context", "messages", "model", "thinkingLevel"}; }
+		@Override protected Object[] componentValues() { return new Object[] {context, messages, model, thinkingLevel}; }
+	}
+
+	/** Runtime state visible immediately before a provider request. */
+	public static final class RequestContext extends ValueObject {
+		private final AgentContext context;
+		private final Model model;
+		private final ThinkingLevel thinkingLevel;
+		public RequestContext(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
 			this.context = context; this.model = model; this.thinkingLevel = thinkingLevel;
 		}
 		public AgentContext context() { return context; }
@@ -135,6 +164,34 @@ public final class AgentLoopConfig {
 		public ThinkingLevel thinkingLevel() { return thinkingLevel; }
 		@Override protected String[] componentNames() { return new String[] {"context", "model", "thinkingLevel"}; }
 		@Override protected Object[] componentValues() { return new Object[] {context, model, thinkingLevel}; }
+	}
+
+	/** Replacement runtime state for the provider request being prepared. */
+	public static final class RequestUpdate extends ValueObject {
+		private final AgentContext context;
+		private final Model model;
+		private final ThinkingLevel thinkingLevel;
+		public RequestUpdate(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
+			this.context = context; this.model = model; this.thinkingLevel = thinkingLevel;
+		}
+		public AgentContext context() { return context; }
+		public Model model() { return model; }
+		public ThinkingLevel thinkingLevel() { return thinkingLevel; }
+		@Override protected String[] componentNames() { return new String[] {"context", "model", "thinkingLevel"}; }
+		@Override protected Object[] componentValues() { return new Object[] {context, model, thinkingLevel}; }
+	}
+
+	public enum TurnAction { CONTINUE, END }
+
+	/** Decision returned by {@link FinishTurn}. Null preserves normal scheduling. */
+	public static final class TurnDecision extends ValueObject {
+		private final TurnAction action;
+		public TurnDecision(TurnAction action) { this.action = action; }
+		public TurnAction action() { return action; }
+		public static TurnDecision continueRun() { return new TurnDecision(TurnAction.CONTINUE); }
+		public static TurnDecision endRun() { return new TurnDecision(TurnAction.END); }
+		@Override protected String[] componentNames() { return new String[] {"action"}; }
+		@Override protected Object[] componentValues() { return new Object[] {action}; }
 	}
 
 	/** Result of {@link BeforeToolCall}. {@code block=true} prevents execution. */
@@ -201,6 +258,16 @@ public final class AgentLoopConfig {
 	@FunctionalInterface
 	public interface ShouldStopAfterTurn {
 		CompletableFuture<Boolean> apply(TurnContext context);
+	}
+
+	@FunctionalInterface
+	public interface FinishTurn {
+		CompletableFuture<TurnDecision> apply(TurnContext context, AbortSignal signal);
+	}
+
+	@FunctionalInterface
+	public interface PrepareRequest {
+		CompletableFuture<RequestUpdate> apply(RequestContext context, AbortSignal signal);
 	}
 
 	@FunctionalInterface
