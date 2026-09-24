@@ -532,6 +532,58 @@ public class AgentRegressionTest {
 		assertEquals(1, streamCalls.get());
 	}
 
+
+	@Test
+	public void maxTurnsDoesNotPrepareAProviderRequestThatWillNotRun() throws Exception {
+		AtomicInteger prepareCalls = new AtomicInteger();
+		AtomicInteger streamCalls = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.maxTurns = 1;
+		config.prepareRequest = (request, signal) -> {
+			prepareCalls.incrementAndGet();
+			return CompletableFuture.completedFuture(null);
+		};
+		AgentTool tool = tool("echo",
+				signal -> CompletableFuture.<AgentToolResult<?>>completedFuture(toolText("ok", false)));
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("go")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.singletonList(tool)),
+				config, event -> {}, new AbortSignal(), (model, context, options) -> {
+					streamCalls.incrementAndGet();
+					return assistantStream(assistant(Collections.<Content>singletonList(
+							new Content.ToolCall("echo-1", "echo", Collections.<String, Object>emptyMap())),
+							StopReason.TOOL_USE, null));
+				});
+
+		assertEquals(1, streamCalls.get());
+		assertEquals("prepareRequest must only run for actual provider requests", 1, prepareCalls.get());
+	}
+
+	@Test
+	public void finishTurnRunsForAbortedResponsesButCannotContinueThem() throws Exception {
+		AtomicInteger finishCalls = new AtomicInteger();
+		AtomicInteger streamCalls = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.finishTurn = (turn, signal) -> {
+			finishCalls.incrementAndGet();
+			assertEquals(StopReason.ABORTED, turn.message().stopReason());
+			return CompletableFuture.completedFuture(AgentLoopConfig.TurnDecision.continueRun());
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("go")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(), (model, context, options) -> {
+					streamCalls.incrementAndGet();
+					return assistantStream(assistant(Collections.<Content>singletonList(new Content.Text("aborted")),
+							StopReason.ABORTED, "aborted"));
+				});
+
+		assertEquals(1, streamCalls.get());
+		assertEquals(1, finishCalls.get());
+	}
+
 	@Test
 	public void finishTurnContinueCreatesExactlyOneContextOnlyFollowUpRequest() throws Exception {
 		AtomicInteger streamCalls = new AtomicInteger();
