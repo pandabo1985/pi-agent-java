@@ -197,7 +197,7 @@ public final class AgentLoop {
 				if (config.prepareRequest != null) {
 					ThinkingLevel thinking = config.reasoning != null ? config.reasoning : ThinkingLevel.OFF;
 					AgentLoopConfig.RequestUpdate requestUpdate = config.prepareRequest.apply(
-							new AgentLoopConfig.RequestContext(currentContext, config.model, thinking), signal).join();
+							new AgentLoopConfig.PrepareRequestContext(currentContext, config.model, thinking), signal).join();
 					if (requestUpdate != null) {
 						if (requestUpdate.context() != null) currentContext = requestUpdate.context();
 						if (requestUpdate.model() != null) config.model = requestUpdate.model();
