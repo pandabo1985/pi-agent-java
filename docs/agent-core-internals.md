@@ -3,6 +3,11 @@
 > 目标：把 `@earendil-works/pi-agent-core`（`packages/agent`）的核心功能拆解为可独立复现的原理。读完本文，可以在任意语言/运行时里重新实现一个等价的"通用 LLM Agent 运行时"。
 >
 > 阅读顺序建议：先看 §1–§3 建立全局观，再精读 §4（核心循环）和 §6（工具系统），这两节是整个库的灵魂。
+>
+> **版本说明（2026-09-24）**：Agent classic runtime 的生命周期与调度语义已按上游
+> `pi-agent-core 0.87.x` / 当日 `packages/agent` 主分支复核。Java 实现仍保留旧式
+> `LlmContext.systemPrompt/tools` Provider 边界；上游已经迁移到 system message 驱动的
+> `TranscriptContext`，这是当前剩余的主要结构性 parity gap。
 
 ---
 
@@ -749,4 +754,4 @@ async function executeToolCalls(ctx, asstMsg, calls, config, signal, emit) {
 
 ---
 
-*本文基于 `@earendil-works/pi-agent-core` v0.84.1 的源码分析。所有算法描述与代码片段均可与 `src/` 下的实现一一对照。*
+*本文最初基于早期版本整理，并于 2026-09-24 按 `pi-agent-core 0.87.x` classic runtime 重新复核生命周期、队列、Tool 与 abort 语义。涉及 Provider 上下文的章节需注意：Java 版尚未完成上游 messages-only `TranscriptContext` / system-message tool declaration 迁移。*
