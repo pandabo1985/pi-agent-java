@@ -13,8 +13,9 @@ underlying principles; this README covers the Java specifics.
 
 **Translated (runs end-to-end):**
 - The low-level agent loop (`AgentLoop`) — the double-`while` kernel, streaming one assistant
-  response, sequential/parallel tool execution, before/after hooks, batch `terminate` semantics,
-  truncation (`length`) protection, steering/follow-up queues.
+  response, sequential/parallel tool execution, before/after hooks, `prepareRequest` /
+  `prepareNextTurn` / `finishTurn` boundaries, batch `terminate` semantics, truncation
+  (`length`) protection, steering/follow-up queues.
 - The stateful `Agent` wrapper — transcript ownership, lifecycle events, queues, abort,
   `waitForIdle`, synthesized error messages on failure.
 - The full type model — `AgentMessage`, `Content`, `AgentEvent`, `AssistantMessageEvent`,
@@ -34,6 +35,20 @@ underlying principles; this README covers the Java specifics.
 
 These are additive on top of the core and are environment-specific; the core here is the
 reusable heart you can build either set of features against.
+
+### Upstream compatibility status
+
+The Java loop now follows the current upstream turn-boundary semantics introduced through
+pi-agent-core 0.84.4/0.87.x: `prepareNextTurn` only runs when another provider request has actually
+been selected, `prepareRequest` runs before every request, `finishTurn` runs before `turn_end`,
+and `finishTurn(CONTINUE)` can request exactly one context-only continuation. The removed
+`shouldStopAfterTurn` API remains deprecated for Java source compatibility.
+
+One larger upstream change is intentionally **not** folded into this compatibility patch yet:
+current TypeScript pi-agent-core stores system instructions and tool loadout changes as transcript
+`system` messages. This Java port still exposes the earlier `LlmContext.systemPrompt/tools`
+wire shape so existing proxy servers are not silently broken. Treat transcript-native system/tool
+declarations as the next migration step rather than mixing that protocol change into the loop fix.
 
 ## Build & run
 
