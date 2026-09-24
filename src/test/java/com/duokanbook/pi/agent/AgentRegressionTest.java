@@ -542,8 +542,13 @@ public class AgentRegressionTest {
 					Collections.<Content>singletonList(new Content.Text("done")), StopReason.STOP, null));
 		};
 		Agent agent = new Agent(options);
-		agent.steer(new AgentMessage.UserMessage("steer later"));
-		agent.followUp(new AgentMessage.UserMessage("follow later"));
+		agent.subscribe((event, signal) -> {
+			if (event instanceof AgentEvent.MessageEnd
+					&& ((AgentEvent.MessageEnd) event).message() instanceof AgentMessage.AssistantMessage) {
+				agent.steer(new AgentMessage.UserMessage("steer later"));
+				agent.followUp(new AgentMessage.UserMessage("follow later"));
+			}
+		});
 
 		agent.prompt("go").get(2, TimeUnit.SECONDS);
 
