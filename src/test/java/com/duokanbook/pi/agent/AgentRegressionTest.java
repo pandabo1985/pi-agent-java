@@ -5,6 +5,8 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import com.sun.net.httpserver.HttpServer;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -19,6 +21,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 
 public class AgentRegressionTest {
@@ -130,6 +133,46 @@ public class AgentRegressionTest {
 			assertEquals(0.3, result.usage().cost().cacheRead(), 0.0);
 			assertEquals(0.4, result.usage().cost().cacheWrite(), 0.0);
 			assertEquals(1.0, result.usage().cost().total(), 0.0);
+		} finally {
+			server.stop(0);
+		}
+	}
+
+
+	@Test
+	public void proxyForwardsLegacyToolDeclarationsInTheRequestContext() throws Exception {
+		AtomicReference<String> requestBody = new AtomicReference<String>();
+		HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+		server.createContext("/api/stream", exchange -> {
+			InputStream input = exchange.getRequestBody();
+			ByteArrayOutputStream captured = new ByteArrayOutputStream();
+			byte[] buffer = new byte[1024];
+			int read;
+			while ((read = input.read(buffer)) != -1) captured.write(buffer, 0, read);
+			requestBody.set(new String(captured.toByteArray(), StandardCharsets.UTF_8));
+			byte[] response = "data:{\"type\":\"done\",\"reason\":\"stop\"}\n\n".getBytes(StandardCharsets.UTF_8);
+			exchange.sendResponseHeaders(200, 0);
+			OutputStream output = exchange.getResponseBody();
+			try { output.write(response); } finally { output.close(); }
+		});
+		server.start();
+		try {
+			AgentTool echo = tool("echo", signal -> CompletableFuture.<AgentToolResult<?>>completedFuture(toolText("ok", false)));
+			ProxyStreamFn proxy = new ProxyStreamFn("http://127.0.0.1:" + server.getAddress().getPort(), "token");
+			proxy.stream(Model.unknown(),
+					new LlmContext("system", Collections.<AgentMessage>emptyList(), Collections.singletonList(echo)),
+					SimpleStreamOptions.builder().build()).result().get(5, TimeUnit.SECONDS);
+
+			@SuppressWarnings("unchecked")
+			Map<String, Object> root = (Map<String, Object>) Json.parse(requestBody.get());
+			@SuppressWarnings("unchecked")
+			Map<String, Object> context = (Map<String, Object>) root.get("context");
+			List<?> tools = (List<?>) context.get("tools");
+			assertEquals(1, tools.size());
+			@SuppressWarnings("unchecked")
+			Map<String, Object> declaration = (Map<String, Object>) tools.get(0);
+			assertEquals("echo", declaration.get("name"));
+			assertEquals("echo", declaration.get("description"));
 		} finally {
 			server.stop(0);
 		}
