@@ -175,6 +175,11 @@ public final class ProxyStreamFn implements StreamFn {
 		List<Object> msgs = new ArrayList<>();
 		for (AgentMessage m : context.messages()) msgs.add(MessageJson.toJson(m));
 		ctx.put("messages", msgs);
+		List<Object> tools = new ArrayList<>();
+		if (context.tools() != null) {
+			for (AgentTool tool : context.tools()) tools.add(MessageJson.toJson(tool));
+		}
+		ctx.put("tools", tools);
 		root.put("context", ctx);
 
 		Map<String, Object> opts = new LinkedHashMap<>();

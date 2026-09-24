@@ -5,6 +5,8 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import com.sun.net.httpserver.HttpServer;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -19,6 +21,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 
 public class AgentRegressionTest {
@@ -130,6 +133,46 @@ public class AgentRegressionTest {
 			assertEquals(0.3, result.usage().cost().cacheRead(), 0.0);
 			assertEquals(0.4, result.usage().cost().cacheWrite(), 0.0);
 			assertEquals(1.0, result.usage().cost().total(), 0.0);
+		} finally {
+			server.stop(0);
+		}
+	}
+
+
+	@Test
+	public void proxyForwardsLegacyToolDeclarationsInTheRequestContext() throws Exception {
+		AtomicReference<String> requestBody = new AtomicReference<String>();
+		HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+		server.createContext("/api/stream", exchange -> {
+			InputStream input = exchange.getRequestBody();
+			ByteArrayOutputStream captured = new ByteArrayOutputStream();
+			byte[] buffer = new byte[1024];
+			int read;
+			while ((read = input.read(buffer)) != -1) captured.write(buffer, 0, read);
+			requestBody.set(new String(captured.toByteArray(), StandardCharsets.UTF_8));
+			byte[] response = "data:{\"type\":\"done\",\"reason\":\"stop\"}\n\n".getBytes(StandardCharsets.UTF_8);
+			exchange.sendResponseHeaders(200, 0);
+			OutputStream output = exchange.getResponseBody();
+			try { output.write(response); } finally { output.close(); }
+		});
+		server.start();
+		try {
+			AgentTool echo = tool("echo", signal -> CompletableFuture.<AgentToolResult<?>>completedFuture(toolText("ok", false)));
+			ProxyStreamFn proxy = new ProxyStreamFn("http://127.0.0.1:" + server.getAddress().getPort(), "token");
+			proxy.stream(Model.unknown(),
+					new LlmContext("system", Collections.<AgentMessage>emptyList(), Collections.singletonList(echo)),
+					SimpleStreamOptions.builder().build()).result().get(5, TimeUnit.SECONDS);
+
+			@SuppressWarnings("unchecked")
+			Map<String, Object> root = (Map<String, Object>) Json.parse(requestBody.get());
+			@SuppressWarnings("unchecked")
+			Map<String, Object> context = (Map<String, Object>) root.get("context");
+			List<?> tools = (List<?>) context.get("tools");
+			assertEquals(1, tools.size());
+			@SuppressWarnings("unchecked")
+			Map<String, Object> declaration = (Map<String, Object>) tools.get(0);
+			assertEquals("echo", declaration.get("name"));
+			assertEquals("echo", declaration.get("description"));
 		} finally {
 			server.stop(0);
 		}
@@ -455,6 +498,124 @@ public class AgentRegressionTest {
 				// Expected.
 			}
 		}
+	}
+
+
+	@Test
+	public void prepareNextTurnRunsOnlyWhenAnotherProviderTurnIsSelected() throws Exception {
+		AtomicInteger prepares = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.prepareNextTurn = context -> {
+			prepares.incrementAndGet();
+			return CompletableFuture.completedFuture(null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("done")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(),
+				(model, context, options) -> assistantStream(assistant(
+						Collections.<Content>singletonList(new Content.Text("ok")), StopReason.STOP, null)));
+
+		assertEquals("terminal turns must not prepare a nonexistent next turn", 0, prepares.get());
+	}
+
+	@Test
+	public void finishTurnRunsBeforeTurnEndAndCanForceExactlyOneContinuation() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		AtomicInteger finishCalls = new AtomicInteger();
+		List<String> ordering = new ArrayList<String>();
+		AgentLoopConfig config = loopConfig();
+		config.finishTurn = (context, signal) -> {
+			ordering.add("finish-" + finishCalls.incrementAndGet());
+			return CompletableFuture.completedFuture(
+					finishCalls.get() == 1 ? AgentLoopConfig.TurnDecision.continueRun() : null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("continue once")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config,
+				event -> {
+					if (event instanceof AgentEvent.TurnEnd) ordering.add("turn-end-" + finishCalls.get());
+				},
+				new AbortSignal(),
+				(model, context, options) -> {
+					int call = streamCalls.incrementAndGet();
+					return assistantStream(assistant(
+							Collections.<Content>singletonList(new Content.Text("response " + call)),
+							StopReason.STOP, null));
+				});
+
+		assertEquals(2, streamCalls.get());
+		assertEquals(Arrays.asList("finish-1", "turn-end-1", "finish-2", "turn-end-2"), ordering);
+	}
+
+	@Test
+	public void prepareRequestRunsBeforeTheFirstProviderRequest() throws Exception {
+		List<String> ordering = new ArrayList<String>();
+		AgentLoopConfig config = loopConfig();
+		config.prepareRequest = (context, signal) -> {
+			ordering.add("prepare");
+			assertEquals(ThinkingLevel.OFF, context.thinkingLevel());
+			return CompletableFuture.completedFuture(null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("hello")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(),
+				(model, context, options) -> {
+					ordering.add("stream");
+					return assistantStream(assistant(
+							Collections.<Content>singletonList(new Content.Text("ok")), StopReason.STOP, null));
+				});
+
+		assertEquals(Arrays.asList("prepare", "stream"), ordering);
+	}
+
+	@Test
+	public void finishTurnEndLeavesQueuedMessagesUntouched() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		Agent.AgentOptions options = new Agent.AgentOptions();
+		options.finishTurn = (context, signal) -> CompletableFuture.completedFuture(AgentLoopConfig.TurnDecision.end());
+		options.streamFn = (model, context, streamOptions) -> {
+			streamCalls.incrementAndGet();
+			return assistantStream(assistant(
+					Collections.<Content>singletonList(new Content.Text("done")), StopReason.STOP, null));
+		};
+		Agent agent = new Agent(options);
+		agent.subscribe((event, signal) -> {
+			if (event instanceof AgentEvent.MessageEnd
+					&& ((AgentEvent.MessageEnd) event).message() instanceof AgentMessage.AssistantMessage) {
+				agent.steer(new AgentMessage.UserMessage("steer later"));
+				agent.followUp(new AgentMessage.UserMessage("follow later"));
+			}
+		});
+
+		agent.prompt("go").get(2, TimeUnit.SECONDS);
+
+		assertEquals(1, streamCalls.get());
+		assertTrue(agent.hasQueuedMessages());
+		assertEquals("steer later",
+				((Content.Text) ((AgentMessage.UserMessage) agent.peekQueuedMessages().get(0)).content().get(0)).text());
+	}
+
+	@Test
+	public void peekQueuedMessagesDoesNotConsumeAndPrefersSteering() {
+		Agent agent = new Agent(new Agent.AgentOptions());
+		agent.followUp(new AgentMessage.UserMessage("follow"));
+		agent.steer(new AgentMessage.UserMessage("steer"));
+
+		List<AgentMessage> first = agent.peekQueuedMessages();
+		List<AgentMessage> second = agent.peekQueuedMessages();
+		assertEquals(first, second);
+		assertEquals("steer",
+				((Content.Text) ((AgentMessage.UserMessage) first.get(0)).content().get(0)).text());
+
+		agent.clearSteeringQueue();
+		assertEquals("follow",
+				((Content.Text) ((AgentMessage.UserMessage) agent.peekQueuedMessages().get(0)).content().get(0)).text());
 	}
 
 	private static AgentLoopConfig loopConfig() {

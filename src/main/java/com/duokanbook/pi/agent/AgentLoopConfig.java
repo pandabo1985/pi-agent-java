@@ -48,7 +48,16 @@ public final class AgentLoopConfig {
 	// ── optional hooks ──
 	public TransformContext transformContext;
 	public GetApiKey getApiKey;
+	/**
+	 * Legacy stop predicate retained for source compatibility. New code should use
+	 * {@link #finishTurn}, which matches pi-agent-core 0.87+ semantics.
+	 */
+	@Deprecated
 	public ShouldStopAfterTurn shouldStopAfterTurn;
+	/** Called after assistant/tool results finalize and before turn_end. */
+	public FinishTurn finishTurn;
+	/** Called immediately before every provider request, including the first. */
+	public PrepareRequest prepareRequest;
 	public PrepareNextTurn prepareNextTurn;
 	public GetMessages getSteeringMessages;
 	public GetMessages getFollowUpMessages;
@@ -122,12 +131,24 @@ public final class AgentLoopConfig {
 		@Override protected Object[] componentValues() { return new Object[] {message, toolResults, context, newMessages}; }
 	}
 
-	/** Replacement runtime state returned from {@link PrepareNextTurn}. */
-	public static final class TurnUpdate extends ValueObject {
+	/** Decision returned by {@link FinishTurn}. */
+	public static final class TurnDecision extends ValueObject {
+		public enum Action { CONTINUE, END }
+		private final Action action;
+		public TurnDecision(Action action) { this.action = action; }
+		public Action action() { return action; }
+		public static TurnDecision continueRun() { return new TurnDecision(Action.CONTINUE); }
+		public static TurnDecision end() { return new TurnDecision(Action.END); }
+		@Override protected String[] componentNames() { return new String[] {"action"}; }
+		@Override protected Object[] componentValues() { return new Object[] {action}; }
+	}
+
+	/** Runtime state available immediately before a provider request. */
+	public static final class PrepareRequestContext extends ValueObject {
 		private final AgentContext context;
 		private final Model model;
 		private final ThinkingLevel thinkingLevel;
-		public TurnUpdate(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
+		public PrepareRequestContext(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
 			this.context = context; this.model = model; this.thinkingLevel = thinkingLevel;
 		}
 		public AgentContext context() { return context; }
@@ -135,6 +156,41 @@ public final class AgentLoopConfig {
 		public ThinkingLevel thinkingLevel() { return thinkingLevel; }
 		@Override protected String[] componentNames() { return new String[] {"context", "model", "thinkingLevel"}; }
 		@Override protected Object[] componentValues() { return new Object[] {context, model, thinkingLevel}; }
+	}
+
+	/** Replacement runtime state returned from {@link PrepareRequest}. */
+	public static final class RequestUpdate extends ValueObject {
+		private final AgentContext context;
+		private final Model model;
+		private final ThinkingLevel thinkingLevel;
+		public RequestUpdate(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
+			this.context = context; this.model = model; this.thinkingLevel = thinkingLevel;
+		}
+		public AgentContext context() { return context; }
+		public Model model() { return model; }
+		public ThinkingLevel thinkingLevel() { return thinkingLevel; }
+		@Override protected String[] componentNames() { return new String[] {"context", "model", "thinkingLevel"}; }
+		@Override protected Object[] componentValues() { return new Object[] {context, model, thinkingLevel}; }
+	}
+
+	/** Replacement runtime state returned from {@link PrepareNextTurn}. */
+	public static final class TurnUpdate extends ValueObject {
+		private final AgentContext context;
+		private final List<AgentMessage> messages;
+		private final Model model;
+		private final ThinkingLevel thinkingLevel;
+		public TurnUpdate(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
+			this(context, null, model, thinkingLevel);
+		}
+		public TurnUpdate(AgentContext context, List<AgentMessage> messages, Model model, ThinkingLevel thinkingLevel) {
+			this.context = context; this.messages = messages; this.model = model; this.thinkingLevel = thinkingLevel;
+		}
+		public AgentContext context() { return context; }
+		public List<AgentMessage> messages() { return messages; }
+		public Model model() { return model; }
+		public ThinkingLevel thinkingLevel() { return thinkingLevel; }
+		@Override protected String[] componentNames() { return new String[] {"context", "messages", "model", "thinkingLevel"}; }
+		@Override protected Object[] componentValues() { return new Object[] {context, messages, model, thinkingLevel}; }
 	}
 
 	/** Result of {@link BeforeToolCall}. {@code block=true} prevents execution. */
@@ -199,8 +255,19 @@ public final class AgentLoopConfig {
 	}
 
 	@FunctionalInterface
+	@Deprecated
 	public interface ShouldStopAfterTurn {
 		CompletableFuture<Boolean> apply(TurnContext context);
+	}
+
+	@FunctionalInterface
+	public interface FinishTurn {
+		CompletableFuture<TurnDecision> apply(TurnContext context, AbortSignal signal);
+	}
+
+	@FunctionalInterface
+	public interface PrepareRequest {
+		CompletableFuture<RequestUpdate> apply(PrepareRequestContext context, AbortSignal signal);
 	}
 
 	@FunctionalInterface
