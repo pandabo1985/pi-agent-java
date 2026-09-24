@@ -34,6 +34,7 @@ public final class Agent {
 
 	// ── Agent-level hook signatures (carry the active signal, like the TS wrapper) ──
 	@FunctionalInterface
+	@Deprecated
 	public interface ShouldStopAfterTurnHook {
 		CompletableFuture<Boolean> apply(AgentLoopConfig.TurnContext ctx, AbortSignal signal);
 	}
