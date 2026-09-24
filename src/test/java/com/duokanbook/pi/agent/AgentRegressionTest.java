@@ -457,6 +457,119 @@ public class AgentRegressionTest {
 		}
 	}
 
+
+	@Test
+	public void prepareNextTurnRunsOnlyWhenAnotherProviderTurnIsSelected() throws Exception {
+		AtomicInteger prepares = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.prepareNextTurn = context -> {
+			prepares.incrementAndGet();
+			return CompletableFuture.completedFuture(null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("done")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(),
+				(model, context, options) -> assistantStream(assistant(
+						Collections.<Content>singletonList(new Content.Text("ok")), StopReason.STOP, null)));
+
+		assertEquals("terminal turns must not prepare a nonexistent next turn", 0, prepares.get());
+	}
+
+	@Test
+	public void finishTurnRunsBeforeTurnEndAndCanForceExactlyOneContinuation() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		AtomicInteger finishCalls = new AtomicInteger();
+		List<String> ordering = new ArrayList<String>();
+		AgentLoopConfig config = loopConfig();
+		config.finishTurn = (context, signal) -> {
+			ordering.add("finish-" + finishCalls.incrementAndGet());
+			return CompletableFuture.completedFuture(
+					finishCalls.get() == 1 ? AgentLoopConfig.TurnDecision.continueRun() : null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("continue once")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config,
+				event -> {
+					if (event instanceof AgentEvent.TurnEnd) ordering.add("turn-end-" + finishCalls.get());
+				},
+				new AbortSignal(),
+				(model, context, options) -> {
+					int call = streamCalls.incrementAndGet();
+					return assistantStream(assistant(
+							Collections.<Content>singletonList(new Content.Text("response " + call)),
+							StopReason.STOP, null));
+				});
+
+		assertEquals(2, streamCalls.get());
+		assertEquals(Arrays.asList("finish-1", "turn-end-1", "finish-2", "turn-end-2"), ordering);
+	}
+
+	@Test
+	public void prepareRequestRunsBeforeTheFirstProviderRequest() throws Exception {
+		List<String> ordering = new ArrayList<String>();
+		AgentLoopConfig config = loopConfig();
+		config.prepareRequest = (context, signal) -> {
+			ordering.add("prepare");
+			assertEquals(ThinkingLevel.OFF, context.thinkingLevel());
+			return CompletableFuture.completedFuture(null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("hello")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(),
+				(model, context, options) -> {
+					ordering.add("stream");
+					return assistantStream(assistant(
+							Collections.<Content>singletonList(new Content.Text("ok")), StopReason.STOP, null));
+				});
+
+		assertEquals(Arrays.asList("prepare", "stream"), ordering);
+	}
+
+	@Test
+	public void finishTurnEndLeavesQueuedMessagesUntouched() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		Agent.AgentOptions options = new Agent.AgentOptions();
+		options.finishTurn = (context, signal) -> CompletableFuture.completedFuture(AgentLoopConfig.TurnDecision.end());
+		options.streamFn = (model, context, streamOptions) -> {
+			streamCalls.incrementAndGet();
+			return assistantStream(assistant(
+					Collections.<Content>singletonList(new Content.Text("done")), StopReason.STOP, null));
+		};
+		Agent agent = new Agent(options);
+		agent.steer(new AgentMessage.UserMessage("steer later"));
+		agent.followUp(new AgentMessage.UserMessage("follow later"));
+
+		agent.prompt("go").get(2, TimeUnit.SECONDS);
+
+		assertEquals(1, streamCalls.get());
+		assertTrue(agent.hasQueuedMessages());
+		assertEquals("steer later",
+				((Content.Text) ((AgentMessage.UserMessage) agent.peekQueuedMessages().get(0)).content().get(0)).text());
+	}
+
+	@Test
+	public void peekQueuedMessagesDoesNotConsumeAndPrefersSteering() {
+		Agent agent = new Agent(new Agent.AgentOptions());
+		agent.followUp(new AgentMessage.UserMessage("follow"));
+		agent.steer(new AgentMessage.UserMessage("steer"));
+
+		List<AgentMessage> first = agent.peekQueuedMessages();
+		List<AgentMessage> second = agent.peekQueuedMessages();
+		assertEquals(first, second);
+		assertEquals("steer",
+				((Content.Text) ((AgentMessage.UserMessage) first.get(0)).content().get(0)).text());
+
+		agent.clearSteeringQueue();
+		assertEquals("follow",
+				((Content.Text) ((AgentMessage.UserMessage) agent.peekQueuedMessages().get(0)).content().get(0)).text());
+	}
+
 	private static AgentLoopConfig loopConfig() {
 		AgentLoopConfig config = new AgentLoopConfig(Model.unknown(),
 				messages -> CompletableFuture.completedFuture(messages));
