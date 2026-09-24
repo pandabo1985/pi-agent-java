@@ -4,8 +4,9 @@ A standalone, dependency-free **Java 8** port of the **core runtime** of the Typ
 `@earendil-works/pi-agent-core` — the general-purpose LLM agent with transport abstraction,
 state management, and tool execution.
 
-This is a faithful reimplementation of the original package's layers ①–③ (the agent loop, the
-stateful `Agent`, and the tool/stream abstraction). It is the executable counterpart of the design
+This is a behavior-focused reimplementation of the original package's layers ①–③ (the agent loop,
+the stateful `Agent`, and the tool/stream abstraction). The classic runtime lifecycle was reviewed
+against upstream `packages/agent` on 2026-09-24. It is the executable counterpart of the design
 document [`docs/agent-core-internals.md`](docs/agent-core-internals.md) — read that for the
 underlying principles; this README covers the Java specifics.
 
@@ -98,6 +99,25 @@ A `StreamFn` is the only provider-specific piece. Implement one against any prov
 (OpenAI, Anthropic, a local server, …) returning an `EventStream<AssistantMessageEvent,
 AgentMessage.AssistantMessage>`. The `StreamFn` contract: **never throw** — encode failures as a
 terminal `AssistantMessageEvent.ErrorEvent` whose message has `stopReason = ABORTED|ERROR`.
+
+## Turn lifecycle hooks
+
+The Java port exposes the current classic-runtime request/turn boundaries:
+
+- `prepareRequest` runs immediately before every provider request, including the first, after
+  selected prompt/steering/prepared messages have been emitted and appended.
+- `finishTurn` runs after the assistant and all tool results are finalized but before
+  `turn_end`. Return `TurnDecision.endRun()` to stop before queue polling, or
+  `TurnDecision.continueRun()` to guarantee exactly one next provider request.
+- `prepareNextTurn` runs only when another turn is actually going to start. Its `TurnUpdate`
+  can replace context/model/thinking level and can append normal transcript messages.
+- `shouldStopAfterTurn` remains available only as a deprecated compatibility hook for older
+  Java callers.
+- `peekQueuedMessages()` previews the next queue-selected batch without consuming it; steering
+  continues to take priority over follow-up input.
+
+These boundaries intentionally preserve event barriers: assistant `message_end` listeners settle
+before tool preflight begins, and `finishTurn` settles before `turn_end`.
 
 ## TypeScript → Java mapping
 
