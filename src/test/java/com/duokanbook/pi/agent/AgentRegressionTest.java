@@ -258,7 +258,7 @@ public class AgentRegressionTest {
 	}
 
 	@Test
-	public void abortDuringToolExecutionCancelsTheToolAndEndsWithoutAResultMessage() throws Exception {
+	public void abortDuringToolExecutionFinalizesAnErrorToolResultBeforeTheRunAborts() throws Exception {
 		CountDownLatch toolStarted = new CountDownLatch(1);
 		CompletableFuture<AgentToolResult<?>> neverCompletes = new CompletableFuture<>();
 		AtomicInteger streamCalls = new AtomicInteger();
@@ -282,10 +282,12 @@ public class AgentRegressionTest {
 
 		assertTrue(neverCompletes.isCancelled());
 		assertEquals(1, streamCalls.get());
-		for (AgentMessage message : agent.state().messages()) {
-			assertTrue("abort must not synthesize a tool result", !(message instanceof AgentMessage.ToolResultMessage));
-		}
-		AgentMessage.AssistantMessage failure = (AgentMessage.AssistantMessage) agent.state().messages().get(2);
+		assertEquals(4, agent.state().messages().size());
+		AgentMessage.ToolResultMessage toolResult =
+				(AgentMessage.ToolResultMessage) agent.state().messages().get(2);
+		assertTrue(toolResult.isError());
+		assertTrue(textOf(toolResult.content()).contains("Operation aborted"));
+		AgentMessage.AssistantMessage failure = (AgentMessage.AssistantMessage) agent.state().messages().get(3);
 		assertEquals(StopReason.ABORTED, failure.stopReason());
 	}
 
@@ -456,6 +458,145 @@ public class AgentRegressionTest {
 			}
 		}
 	}
+
+
+	@Test
+	public void prepareRequestRunsBeforeTheFirstProviderCallAfterPromptSelection() throws Exception {
+		AtomicInteger prepareCalls = new AtomicInteger();
+		AtomicInteger streamCalls = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.prepareRequest = (request, signal) -> {
+			prepareCalls.incrementAndGet();
+			assertEquals(1, request.context().messages.size());
+			assertEquals("user", request.context().messages.get(0).role());
+			return CompletableFuture.completedFuture(null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("hello")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(), (model, context, options) -> {
+					streamCalls.incrementAndGet();
+					return assistantStream(assistant(Collections.<Content>singletonList(new Content.Text("done")),
+							StopReason.STOP, null));
+				});
+
+		assertEquals(1, prepareCalls.get());
+		assertEquals(1, streamCalls.get());
+	}
+
+	@Test
+	public void finishTurnContinueCreatesExactlyOneContextOnlyFollowUpRequest() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		AtomicInteger finishCalls = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.finishTurn = (turn, signal) -> {
+			int call = finishCalls.incrementAndGet();
+			return CompletableFuture.completedFuture(
+					call == 1 ? AgentLoopConfig.TurnDecision.continueRun() : null);
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("hello")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(), (model, context, options) -> {
+					int call = streamCalls.incrementAndGet();
+					return assistantStream(assistant(Collections.<Content>singletonList(new Content.Text("response " + call)),
+							StopReason.STOP, null));
+				});
+
+		assertEquals(2, streamCalls.get());
+		assertEquals(2, finishCalls.get());
+	}
+
+	@Test
+	public void finishTurnEndSkipsSteeringAndFollowUpPolling() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		AtomicInteger steeringPolls = new AtomicInteger();
+		AtomicInteger followUpPolls = new AtomicInteger();
+		AgentLoopConfig config = loopConfig();
+		config.finishTurn = (turn, signal) ->
+				CompletableFuture.completedFuture(AgentLoopConfig.TurnDecision.endRun());
+		config.getSteeringMessages = () -> {
+			steeringPolls.incrementAndGet();
+			return CompletableFuture.completedFuture(Collections.<AgentMessage>emptyList());
+		};
+		config.getFollowUpMessages = () -> {
+			followUpPolls.incrementAndGet();
+			return CompletableFuture.completedFuture(
+					Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("later")));
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("hello")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(), (model, context, options) -> {
+					streamCalls.incrementAndGet();
+					return assistantStream(assistant(Collections.<Content>singletonList(new Content.Text("done")),
+							StopReason.STOP, null));
+				});
+
+		assertEquals(1, streamCalls.get());
+		assertEquals(1, steeringPolls.get()); // initial startup poll only
+		assertEquals(0, followUpPolls.get());
+	}
+
+	@Test
+	public void prepareNextTurnCanAppendMessagesBeforeTheNextRequest() throws Exception {
+		AtomicInteger streamCalls = new AtomicInteger();
+		AtomicInteger finishCalls = new AtomicInteger();
+		AtomicInteger prepareCalls = new AtomicInteger();
+		List<List<String>> visibleText = new ArrayList<>();
+		AgentLoopConfig config = loopConfig();
+		config.finishTurn = (turn, signal) -> CompletableFuture.completedFuture(
+				finishCalls.incrementAndGet() == 1 ? AgentLoopConfig.TurnDecision.continueRun() : null);
+		config.prepareNextTurn = turn -> {
+			prepareCalls.incrementAndGet();
+			return CompletableFuture.completedFuture(new AgentLoopConfig.TurnUpdate(
+					null,
+					Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("prepared")),
+					null,
+					null));
+		};
+
+		AgentLoop.runAgentLoop(
+				Collections.<AgentMessage>singletonList(new AgentMessage.UserMessage("hello")),
+				new AgentContext("", new ArrayList<AgentMessage>(), Collections.<AgentTool>emptyList()),
+				config, event -> {}, new AbortSignal(), (model, context, options) -> {
+					streamCalls.incrementAndGet();
+					List<String> texts = new ArrayList<>();
+					for (AgentMessage message : context.messages()) {
+						if (message instanceof AgentMessage.UserMessage) {
+							texts.add(textOf(((AgentMessage.UserMessage) message).content()));
+						}
+					}
+					visibleText.add(texts);
+					return assistantStream(assistant(Collections.<Content>singletonList(new Content.Text("done")),
+							StopReason.STOP, null));
+				});
+
+		assertEquals(2, streamCalls.get());
+		assertEquals(1, prepareCalls.get());
+		assertEquals(Collections.singletonList("hello"), visibleText.get(0));
+		assertEquals(Arrays.asList("hello", "prepared"), visibleText.get(1));
+	}
+
+	@Test
+	public void peekQueuedMessagesRespectsPriorityAndModeWithoutConsuming() {
+		Agent agent = new Agent(new Agent.AgentOptions());
+		agent.followUp(new AgentMessage.UserMessage("follow"));
+		agent.steer(new AgentMessage.UserMessage("first"));
+		agent.steer(new AgentMessage.UserMessage("second"));
+
+		assertEquals(1, agent.peekQueuedMessages().size());
+		assertEquals("first", textOf(((AgentMessage.UserMessage) agent.peekQueuedMessages().get(0)).content()));
+		assertTrue(agent.hasQueuedMessages());
+
+		agent.setSteeringMode(QueueMode.ALL);
+		assertEquals(2, agent.peekQueuedMessages().size());
+		assertTrue(agent.hasQueuedMessages());
+	}
+
 
 	private static AgentLoopConfig loopConfig() {
 		AgentLoopConfig config = new AgentLoopConfig(Model.unknown(),
