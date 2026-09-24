@@ -119,6 +119,21 @@ The Java port exposes the current classic-runtime request/turn boundaries:
 These boundaries intentionally preserve event barriers: assistant `message_end` listeners settle
 before tool preflight begins, and `finishTurn` settles before `turn_end`.
 
+## Current upstream compatibility gap
+
+The classic loop lifecycle is aligned with the upstream `packages/agent` behavior reviewed on
+2026-09-24, including `prepareRequest`, `finishTurn`, next-turn scheduling, queue precedence,
+parallel-tool ordering, and abort-to-tool-result behavior.
+
+One larger protocol migration is intentionally still pending: current upstream `pi-ai` provider
+streams receive a `TranscriptContext` whose system prompt and tool declarations live in transcript
+`system` messages. This Java port still exposes the older `LlmContext.systemPrompt/tools` shape.
+Until that migration lands, `ProxyStreamFn` explicitly serializes configured tools so proxy-mode
+agents do not silently lose their tool declarations.
+
+The next parity milestone is therefore: `SystemMessage` + `toolsAdded/toolsRemoved` +
+`declareToolChanges()` + provider-facing messages-only transcript context.
+
 ## TypeScript → Java mapping
 
 | TypeScript (`packages/agent/src`)            | Java (`com.duokanbook.pi.agent`)                   |
