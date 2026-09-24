@@ -152,11 +152,11 @@ public final class AgentLoopConfig {
 	}
 
 	/** Runtime state visible immediately before a provider request. */
-	public static final class RequestContext extends ValueObject {
+	public static final class PrepareRequestContext extends ValueObject {
 		private final AgentContext context;
 		private final Model model;
 		private final ThinkingLevel thinkingLevel;
-		public RequestContext(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
+		public PrepareRequestContext(AgentContext context, Model model, ThinkingLevel thinkingLevel) {
 			this.context = context; this.model = model; this.thinkingLevel = thinkingLevel;
 		}
 		public AgentContext context() { return context; }
@@ -256,6 +256,7 @@ public final class AgentLoopConfig {
 	}
 
 	@FunctionalInterface
+	@Deprecated
 	public interface ShouldStopAfterTurn {
 		CompletableFuture<Boolean> apply(TurnContext context);
 	}
@@ -267,7 +268,7 @@ public final class AgentLoopConfig {
 
 	@FunctionalInterface
 	public interface PrepareRequest {
-		CompletableFuture<RequestUpdate> apply(RequestContext context, AbortSignal signal);
+		CompletableFuture<RequestUpdate> apply(PrepareRequestContext context, AbortSignal signal);
 	}
 
 	@FunctionalInterface
